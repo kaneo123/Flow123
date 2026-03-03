@@ -1,0 +1,55 @@
+name: flowtill
+description: "A dynamic and intuitive EPOS till interface designed for speed and simplicity, featuring a customizable product grid and a streamlined order panel to keep your business flowing smoothly."
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.6.0
+
+dependencies:
+  sqflite: ^2.0.0
+  package_info_plus: ^9.0.0
+  sqflite_common_ffi_web: ^1.0.0
+  sqflite_common_ffi: ^2.0.0
+  connectivity_plus: ^7.0.0
+  path: ^1.8.3
+  path_provider: ^2.1.0
+  sqlite3_flutter_libs: 0.5.41
+  drift_flutter: 0.2.8
+  drift: ^2.0.0
+  window_manager: 0.5.1
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  google_fonts: ^6.1.0
+  provider: ^6.0.0
+  shared_preferences: ^2.0.0
+  intl: ^0.19.0
+  uuid: ^4.0.0
+  go_router: ^14.6.2
+  supabase_flutter: '>=1.10.0'
+  esc_pos_utils_plus: ^2.0.0
+  flutter_pos_printer_platform_image_3_sdt: ^1.0.0
+  device_info_plus: ^12.3.0
+  universal_io: ^2.3.1
+  url_launcher: ^6.0.0
+  dio: ^5.0.0
+  permission_handler: ^12.0.0
+  open_filex: ^4.7.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.11.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/images/flowicon.png
+  remove_alpha_ios: true

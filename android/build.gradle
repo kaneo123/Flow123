@@ -1,0 +1,64 @@
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.buildDir = "../build"
+
+// Consolidated subprojects configuration - enforce JVM 17 everywhere
+subprojects {
+    afterEvaluate { project ->
+        // Force Kotlin JVM target to 17 for ALL subprojects (including plugins like network_info_plus)
+        project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+            kotlinOptions {
+                jvmTarget = "17"
+            }
+        }
+        
+        // Force Java source/target compatibility to 17 for ALL Android modules
+        if (project.hasProperty("android")) {
+            project.android.compileOptions {
+                sourceCompatibility JavaVersion.VERSION_17
+                targetCompatibility JavaVersion.VERSION_17
+            }
+        }
+        
+        // Suppress deprecation warnings from third-party plugins (e.g., sqflite_android)
+        // This hides noise from plugin code we cannot modify, but does NOT suppress real errors
+        project.tasks.withType(JavaCompile).configureEach {
+            options.compilerArgs << "-Xlint:-deprecation"
+        }
+        
+        // Set compileSdkVersion for all Android modules
+        if (project.plugins.hasPlugin("com.android.application") ||
+                project.plugins.hasPlugin("com.android.library")) {
+            project.android {
+                compileSdkVersion 36
+            }
+        }
+        
+        // Auto-set namespace for modules that don't have one
+        if (project.hasProperty('android')) {
+            project.android {
+                if (namespace == null) {
+                    namespace project.group
+                }
+            }
+        }
+    }
+    
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+    project.evaluationDependsOn(":app")
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}
+
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('key.properties')
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
