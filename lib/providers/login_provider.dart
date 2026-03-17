@@ -3,6 +3,7 @@ import 'package:flowtill/services/staff_service.dart';
 import 'package:flowtill/models/staff.dart';
 
 /// ViewModel for staff login screen with PIN entry
+/// Handles single-step authentication with outlet context
 class LoginProvider with ChangeNotifier {
   final StaffService _staffService = StaffService();
   
@@ -11,7 +12,7 @@ class LoginProvider with ChangeNotifier {
   bool _isLoading = false;
   bool _shouldShake = false;
   Staff? _authenticatedStaff;
-
+  
   String get pin => _pin;
   String get errorMessage => _errorMessage;
   bool get isLoading => _isLoading;
@@ -47,8 +48,16 @@ class LoginProvider with ChangeNotifier {
     notifyListeners();
   }
 
-  /// Login with PIN - called automatically when 4 digits entered
-  Future<bool> loginWithPin(String outletId) async {
+  /// Set error message manually
+  void setError(String message) {
+    _errorMessage = message;
+    _pin = '';
+    _triggerShake();
+  }
+
+  /// Authenticate staff with PIN for a specific outlet
+  /// Always requires an outletId to be selected
+  Future<bool> authenticateWithPin(String outletId) async {
     if (_pin.length != 4) {
       _errorMessage = 'PIN must be exactly 4 digits';
       _triggerShake();
@@ -57,35 +66,32 @@ class LoginProvider with ChangeNotifier {
 
     _isLoading = true;
     _errorMessage = '';
-    _authenticatedStaff = null;
     notifyListeners();
 
     try {
-      debugPrint('🔐 LoginProvider: Authenticating PIN: $_pin for outlet: $outletId');
+      debugPrint('🔐 LoginProvider: Authenticating staff for outlet: $outletId');
       
       final result = await _staffService.authenticateStaff(_pin, outletId);
       
       _isLoading = false;
       
       if (result.isSuccess && result.data != null) {
-        // Success - store authenticated staff
         _authenticatedStaff = result.data;
-        debugPrint('✅ LoginProvider: Authentication successful for ${_authenticatedStaff!.fullName}');
+        debugPrint('✅ LoginProvider: Authentication successful');
         notifyListeners();
         return true;
       } else {
-        // Invalid PIN - clear PIN and show error
         debugPrint('❌ LoginProvider: Authentication failed - ${result.error}');
-        _errorMessage = 'Incorrect PIN, please try again';
-        _pin = ''; // Clear PIN buffer
+        _errorMessage = result.error ?? 'Authentication failed';
+        _pin = '';
         _triggerShake();
         return false;
       }
     } catch (e) {
-      debugPrint('❌ LoginProvider: Error validating PIN: $e');
+      debugPrint('❌ LoginProvider: Error authenticating: $e');
       _isLoading = false;
-      _errorMessage = 'Error validating PIN. Please try again.';
-      _pin = ''; // Clear PIN buffer
+      _errorMessage = 'Authentication error. Please try again.';
+      _pin = '';
       _triggerShake();
       return false;
     }
@@ -116,11 +122,5 @@ class LoginProvider with ChangeNotifier {
     _pin = '';
     _errorMessage = '';
     notifyListeners();
-  }
-
-  /// Set error message manually
-  void setError(String message) {
-    _errorMessage = message;
-    _triggerShake();
   }
 }

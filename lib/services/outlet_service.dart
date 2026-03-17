@@ -5,20 +5,35 @@ import 'package:flowtill/models/outlet.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
 import 'package:flowtill/database/app_database.dart';
 import 'package:flowtill/services/connection_service.dart';
+import 'package:flowtill/config/sync_config.dart';
 
 /// Service for outlet data operations
 class OutletService {
   final AppDatabase _db = AppDatabase.instance;
   final ConnectionService _connectionService = ConnectionService();
 
-  /// Get all active outlets (online-first: checks connectivity, not platform)
+  /// Get all active outlets (local-first when flag enabled, otherwise online-first)
   /// Returns a result with outlets or error message
-  /// Falls back to local DB when offline or if Supabase fails
+  /// Falls back to Supabase when local is unavailable
   Future<ServiceResult<List<Outlet>>> getAllOutlets() async {
+    // Step 3: LOCAL MIRROR FIRST (when feature flag is enabled)
+    if (kUseLocalMirrorReads && !kIsWeb) {
+      debugPrint('[LOCAL_MIRROR] OutletService: Trying local mirror first');
+      
+      final localResult = await _getAllOutletsFromLocalMirror();
+      if (localResult.isSuccess && localResult.data != null && localResult.data!.isNotEmpty) {
+        debugPrint('[LOCAL_MIRROR] ✅ Using local data for outlets (${localResult.data!.length} records, source=local)');
+        return localResult;
+      }
+      
+      debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for outlets');
+    }
+    
+    // Original logic: Web platform or online-first
     // Web platform: Always try Supabase (connectivity check is unreliable on web)
     // Mobile/Desktop: Check connectivity before attempting Supabase
     if (kIsWeb || _connectionService.isOnline) {
-      debugPrint('🌐 ${kIsWeb ? "Web platform" : "Online"} - fetching outlets from Supabase');
+      debugPrint('🌐 ${kIsWeb ? "Web platform" : "Online"} - fetching outlets from Supabase (source=supabase)');
       final supabaseResult = await _getAllOutletsFromSupabase();
       
       // If successful and not on web, sync to local DB for offline use
@@ -98,6 +113,54 @@ class OutletService {
     }
   }
 
+  /// Get all active outlets from local mirror table (Step 3: local-first reads)
+  Future<ServiceResult<List<Outlet>>> _getAllOutletsFromLocalMirror() async {
+    debugPrint('  📂 Reading from local mirror table: outlets');
+
+    try {
+      final db = await _db.database;
+      final results = await db.query('outlets', where: 'active = ?', whereArgs: [1]);
+
+      if (results.isEmpty) {
+        debugPrint('  ⚠️ Local mirror table empty: outlets');
+        return ServiceResult.failure('Local mirror table empty');
+      }
+
+      final outlets = <Outlet>[];
+      for (final json in results) {
+        try {
+          debugPrint('  📦 Parsing outlet from local mirror: ${json['name']}');
+          debugPrint('     Available columns: ${json.keys.join(", ")}');
+          
+          // Parse settings from JSON string if needed
+          Map<String, dynamic>? settings;
+          if (json['settings'] != null) {
+            final settingsStr = json['settings'] as String;
+            try {
+              settings = Map<String, dynamic>.from(jsonDecode(settingsStr) as Map);
+            } catch (e) {
+              debugPrint('  ⚠️ Failed to parse outlet settings: $e');
+            }
+          }
+
+          final outlet = Outlet.fromJson(json);
+          outlets.add(outlet);
+        } catch (e, stackTrace) {
+          debugPrint('  ❌ Failed to parse outlet from local mirror: $e');
+          debugPrint('     Row data: $json');
+          debugPrint('     Stack: $stackTrace');
+          // Continue parsing other outlets
+        }
+      }
+
+      debugPrint('  ✅ Local mirror has ${outlets.length} outlets');
+      return ServiceResult.success(outlets);
+    } catch (e) {
+      debugPrint('  ❌ Failed to read from local mirror: $e');
+      return ServiceResult.failure('Failed to read local mirror: ${e.toString()}');
+    }
+  }
+
   /// Get all active outlets from local database (when offline)
   Future<ServiceResult<List<Outlet>>> _getAllOutletsFromLocalDB() async {
     debugPrint('🏪 OutletService: Fetching all outlets (from local DB - OFFLINE)');
@@ -148,30 +211,64 @@ class OutletService {
     try {
       debugPrint('💾 Syncing ${outlets.length} outlets to local DB');
       final db = await _db.database;
+      
+      // Get local table columns to ensure we only write what exists
+      final localColumns = await _getLocalTableColumns(db, 'outlets');
+      debugPrint('📋 Local outlets table has ${localColumns.length} columns: ${localColumns.join(", ")}');
+      
       final batch = db.batch();
       
       for (final outlet in outlets) {
+        final outletData = {
+          'id': outlet.id,
+          'name': outlet.name,
+          'code': outlet.code,
+          'active': outlet.active ? 1 : 0,
+          'settings': outlet.settings != null ? jsonEncode(outlet.settings) : null,
+          'enable_service_charge': outlet.enableServiceCharge ? 1 : 0,
+          'service_charge_percent': outlet.serviceChargePercent,
+          'created_at': outlet.createdAt.millisecondsSinceEpoch,
+        };
+        
+        // Filter to only include columns that exist in local table
+        final filteredData = <String, dynamic>{};
+        for (final entry in outletData.entries) {
+          if (localColumns.contains(entry.key)) {
+            filteredData[entry.key] = entry.value;
+          }
+        }
+        
+        debugPrint('   Writing outlet "${outlet.name}" with columns: ${filteredData.keys.join(", ")}');
+        
         batch.insert(
           'outlets',
-          {
-            'id': outlet.id,
-            'name': outlet.name,
-            'code': outlet.code,
-            'active': outlet.active ? 1 : 0,
-            'settings': outlet.settings != null ? jsonEncode(outlet.settings) : null,
-            'enable_service_charge': outlet.enableServiceCharge ? 1 : 0,
-            'service_charge_percent': outlet.serviceChargePercent,
-            'updated_at': DateTime.now().millisecondsSinceEpoch,
-          },
+          filteredData,
           conflictAlgorithm: ConflictAlgorithm.replace,
         );
       }
       
       await batch.commit(noResult: true);
       debugPrint('✅ Outlets synced to local DB successfully');
-    } catch (e) {
+    } catch (e, stackTrace) {
       debugPrint('❌ Failed to sync outlets to local DB: $e');
+      debugPrint('Stack: $stackTrace');
       rethrow;
+    }
+  }
+  
+  /// Get list of column names for a local table
+  Future<Set<String>> _getLocalTableColumns(Database db, String tableName) async {
+    try {
+      final result = await db.rawQuery('PRAGMA table_info($tableName)');
+      final columns = <String>{};
+      for (final row in result) {
+        final columnName = row['name'] as String;
+        columns.add(columnName);
+      }
+      return columns;
+    } catch (e) {
+      debugPrint('⚠️ Failed to get columns for $tableName: $e');
+      return {};
     }
   }
 

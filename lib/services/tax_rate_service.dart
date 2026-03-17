@@ -2,11 +2,29 @@ import 'package:flutter/foundation.dart';
 import 'package:flowtill/models/tax_rate.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
 import 'package:flowtill/services/outlet_service.dart';
+import 'package:flowtill/database/app_database.dart';
+import 'package:flowtill/config/sync_config.dart';
 
 class TaxRateService {
+  final AppDatabase _db = AppDatabase.instance;
+
   Future<ServiceResult<List<TaxRate>>> getAllTaxRates() async {
     debugPrint('💰 TaxRateService: Fetching all tax rates');
 
+    // Step 3: LOCAL MIRROR FIRST (when feature flag is enabled)
+    if (kUseLocalMirrorReads && !kIsWeb) {
+      debugPrint('[LOCAL_MIRROR] TaxRateService: Trying local mirror first');
+      
+      final localResult = await _getTaxRatesFromLocalMirror();
+      if (localResult.isSuccess && localResult.data != null && localResult.data!.isNotEmpty) {
+        debugPrint('[LOCAL_MIRROR] ✅ Using local data for tax_rates (${localResult.data!.length} records, source=local)');
+        return localResult;
+      }
+      
+      debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for tax_rates');
+    }
+
+    // Original Supabase logic
     final result = await SupabaseService.select('tax_rates', orderBy: 'name');
 
     if (!result.isSuccess) {
@@ -19,10 +37,32 @@ class TaxRateService {
 
     try {
       final taxRates = result.data!.map((json) => TaxRate.fromJson(json)).toList();
-      debugPrint('✅ TaxRateService: ${taxRates.length} tax rates loaded');
+      debugPrint('✅ TaxRateService: ${taxRates.length} tax rates loaded (source=supabase)');
       return ServiceResult.success(taxRates);
     } catch (e) {
       return ServiceResult.failure('Failed to parse tax rates: ${e.toString()}');
+    }
+  }
+
+  /// Get tax rates from local mirror table
+  Future<ServiceResult<List<TaxRate>>> _getTaxRatesFromLocalMirror() async {
+    debugPrint('  📂 Reading from local mirror table: tax_rates');
+
+    try {
+      final db = await _db.database;
+      final results = await db.query('tax_rates', orderBy: 'name');
+
+      if (results.isEmpty) {
+        debugPrint('  ⚠️ Local mirror table empty: tax_rates');
+        return ServiceResult.failure('Local mirror table empty');
+      }
+
+      final taxRates = results.map((json) => TaxRate.fromJson(json)).toList();
+      debugPrint('  ✅ Local mirror has ${taxRates.length} tax rates');
+      return ServiceResult.success(taxRates);
+    } catch (e) {
+      debugPrint('  ❌ Failed to read from local mirror: $e');
+      return ServiceResult.failure('Failed to read local mirror: ${e.toString()}');
     }
   }
 

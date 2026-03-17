@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 class ModifierOption {
   final String id;
   final String groupId;
@@ -26,13 +28,11 @@ class ModifierOption {
     groupId: json['group_id'] as String,
     outletId: json['outlet_id'] as String,
     name: json['name'] as String,
-    priceDelta: (json['price_delta'] as num?)?.toDouble() ?? 0.0,
-    isDefault: json['is_default'] as bool? ?? false,
-    sortOrder: json['sort_order'] as int? ?? 0,
-    active: json['active'] as bool? ?? true,
-    createdAt: json['created_at'] != null 
-        ? DateTime.tryParse(json['created_at'] as String) 
-        : null,
+    priceDelta: SQLiteConverters.toDouble(json['price_delta']) ?? 0.0,
+    isDefault: SQLiteConverters.toBool(json['is_default']) ?? false,
+    sortOrder: SQLiteConverters.toInt(json['sort_order']) ?? 0,
+    active: SQLiteConverters.toBool(json['active']) ?? true,
+    createdAt: SQLiteConverters.toDateTime(json['created_at']),
   );
 
   Map<String, dynamic> toJson() => {

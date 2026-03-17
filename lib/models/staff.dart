@@ -1,10 +1,12 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 class Staff {
   final String id;
   final String fullName;
-  final String? roleId;
+  final String? roleId; // Role for the current outlet context
   final int? _permissionLevel;
   final String pinCode;
-  final String outletId;
+  final String? outletId; // Current outlet context (set after outlet selection)
   final bool active;
   final DateTime? lastLoginAt;
   final DateTime createdAt;
@@ -12,7 +14,7 @@ class Staff {
   /// Get permission level, defaulting to 1 if not set
   int get permissionLevel => _permissionLevel ?? 1;
 
-  /// List of outlet IDs this staff member is associated with
+  /// List of outlet IDs this staff member is associated with (from staff_outlets table)
   final List<String>? associatedOutletIds;
 
   Staff({
@@ -21,7 +23,7 @@ class Staff {
     this.roleId,
     int? permissionLevel,
     required this.pinCode,
-    required this.outletId,
+    this.outletId, // Now optional - set during login after outlet selection
     this.active = true,
     this.lastLoginAt,
     DateTime? createdAt,
@@ -34,16 +36,12 @@ class Staff {
       id: json['id'] as String? ?? '',
       fullName: json['full_name'] as String? ?? '',
       roleId: json['role_id'] as String?,
-      permissionLevel: json['permission_level'] as int?,
+      permissionLevel: SQLiteConverters.toInt(json['permission_level']),
       pinCode: json['pin_code'] as String? ?? '',
-      outletId: json['outlet_id'] as String? ?? '',
-      active: json['active'] as bool? ?? true,
-      lastLoginAt: json['last_login_at'] != null
-          ? DateTime.parse(json['last_login_at'] as String)
-          : null,
-      createdAt: json['created_at'] != null
-          ? DateTime.parse(json['created_at'] as String)
-          : DateTime.now(),
+      outletId: json['outlet_id'] as String?, // Can be null until outlet is selected
+      active: SQLiteConverters.toBool(json['active']) ?? true,
+      lastLoginAt: SQLiteConverters.toDateTime(json['last_login_at']),
+      createdAt: SQLiteConverters.toDateTime(json['created_at']) ?? DateTime.now(),
       associatedOutletIds: json['associated_outlet_ids'] != null
           ? List<String>.from(json['associated_outlet_ids'])
           : null,

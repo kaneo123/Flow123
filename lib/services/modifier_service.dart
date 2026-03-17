@@ -3,6 +3,9 @@ import 'package:flowtill/models/modifier_group.dart';
 import 'package:flowtill/models/modifier_option.dart';
 import 'package:flowtill/models/product_modifier_group_link.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
+import 'package:flowtill/database/app_database.dart';
+import 'package:flowtill/config/sync_config.dart';
+import 'package:flowtill/services/outlet_service.dart';
 
 /// Rules for a specific modifier group with overrides applied
 class ModifierGroupRules {
@@ -42,6 +45,8 @@ class ModifierGroupRules {
 
 /// Service for managing product modifiers
 class ModifierService {
+  final AppDatabase _db = AppDatabase.instance;
+
   // Cache maps
   final Map<String, ProductModifierGroupLink> _linksByProductId = {};
   final Map<String, List<ProductModifierGroupLink>> _linksGroupedByProduct = {};
@@ -50,31 +55,94 @@ class ModifierService {
   
   bool _isLoaded = false;
 
-  /// Load all modifier data for an outlet
+  /// Load all modifier data for an outlet (local-first when flag enabled)
   Future<bool> loadModifiersForOutlet(String outletId) async {
     try {
       debugPrint('🔧 ModifierService: Loading modifiers for outlet $outletId');
 
-      // 1. Load product_modifier_groups links
-      debugPrint('   📋 Querying product_modifier_groups with outlet_id: $outletId');
-      final linksResult = await SupabaseService.select(
-        'product_modifier_groups',
-        filters: {'outlet_id': outletId, 'active': true},
-        orderBy: 'sort_order',
-        ascending: true,
-      );
+      List<ProductModifierGroupLink> links = [];
+      List<ModifierGroup> groups = [];
+      List<ModifierOption> options = [];
+      bool usedLocal = false;
 
-      if (!linksResult.isSuccess) {
-        debugPrint('❌ Failed to load product modifier links: ${linksResult.error}');
-        return false;
+      // Step 3: LOCAL MIRROR FIRST (when feature flag is enabled)
+      if (kUseLocalMirrorReads && !kIsWeb) {
+        debugPrint('[LOCAL_MIRROR] ModifierService: Trying local mirror first');
+        
+        final localResult = await _loadModifiersFromLocalMirror(outletId);
+        if (localResult != null) {
+          links = localResult['links'] as List<ProductModifierGroupLink>;
+          groups = localResult['groups'] as List<ModifierGroup>;
+          options = localResult['options'] as List<ModifierOption>;
+          usedLocal = true;
+          debugPrint('[LOCAL_MIRROR] ✅ Using local data for modifiers (links=${links.length}, groups=${groups.length}, options=${options.length}, source=local)');
+        } else {
+          debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for modifiers');
+        }
       }
 
-      final links = linksResult.data!
-          .map((json) => ProductModifierGroupLink.fromJson(json))
-          .toList();
+      // Load from Supabase if not using local
+      if (!usedLocal) {
+        // 1. Load product_modifier_groups links
+        debugPrint('   📋 Querying product_modifier_groups with outlet_id: $outletId (source=supabase)');
+        final linksResult = await SupabaseService.select(
+          'product_modifier_groups',
+          filters: {'outlet_id': outletId, 'active': true},
+          orderBy: 'sort_order',
+          ascending: true,
+        );
 
-      debugPrint('   ✅ Loaded ${links.length} product modifier links');
-      
+        if (!linksResult.isSuccess) {
+          debugPrint('❌ Failed to load product modifier links: ${linksResult.error}');
+          return false;
+        }
+
+        links = linksResult.data!
+            .map((json) => ProductModifierGroupLink.fromJson(json))
+            .toList();
+
+        debugPrint('   ✅ Loaded ${links.length} product modifier links');
+
+        // 2. Load modifier_groups
+        final groupsResult = await SupabaseService.select(
+          'modifier_groups',
+          filters: {'outlet_id': outletId, 'active': true},
+          orderBy: 'sort_order',
+          ascending: true,
+        );
+
+        if (!groupsResult.isSuccess) {
+          debugPrint('❌ Failed to load modifier groups: ${groupsResult.error}');
+          return false;
+        }
+
+        groups = groupsResult.data!
+            .map((json) => ModifierGroup.fromJson(json))
+            .toList();
+
+        debugPrint('   Loaded ${groups.length} modifier groups');
+
+        // 3. Load modifier_options
+        final optionsResult = await SupabaseService.select(
+          'modifier_options',
+          filters: {'outlet_id': outletId, 'active': true},
+          orderBy: 'sort_order',
+          ascending: true,
+        );
+
+        if (!optionsResult.isSuccess) {
+          debugPrint('❌ Failed to load modifier options: ${optionsResult.error}');
+          return false;
+        }
+
+        options = optionsResult.data!
+            .map((json) => ModifierOption.fromJson(json))
+            .toList();
+
+        debugPrint('   Loaded ${options.length} modifier options');
+      }
+
+      // Build cache maps from loaded data
       if (links.isEmpty) {
         debugPrint('   ⚠️ WARNING: No product modifier links found for outlet $outletId');
         debugPrint('   ⚠️ Check if your product_modifier_groups table has records with this outlet_id');
@@ -92,59 +160,12 @@ class ModifierService {
         final sampleProducts = _linksGroupedByProduct.keys.take(3).toList();
         debugPrint('   🔍 Sample product IDs with modifiers: $sampleProducts');
         debugPrint('   🔍 Total products with modifiers: ${_linksGroupedByProduct.length}');
-        
-        // Check for test product specifically
-        final testProductId = 'd6f42c99-16c8-4010-9b22-7c897265d2d3';
-        if (_linksGroupedByProduct.containsKey(testProductId)) {
-          final testLinks = _linksGroupedByProduct[testProductId]!;
-          debugPrint('   ✅ Test product $testProductId found with ${testLinks.length} modifier links');
-        } else {
-          debugPrint('   ❌ Test product $testProductId NOT found in loaded links');
-        }
       }
-
-      // 2. Load modifier_groups
-      final groupsResult = await SupabaseService.select(
-        'modifier_groups',
-        filters: {'outlet_id': outletId, 'active': true},
-        orderBy: 'sort_order',
-        ascending: true,
-      );
-
-      if (!groupsResult.isSuccess) {
-        debugPrint('❌ Failed to load modifier groups: ${groupsResult.error}');
-        return false;
-      }
-
-      final groups = groupsResult.data!
-          .map((json) => ModifierGroup.fromJson(json))
-          .toList();
-
-      debugPrint('   Loaded ${groups.length} modifier groups');
 
       _groupsById.clear();
       for (final group in groups) {
         _groupsById[group.id] = group;
       }
-
-      // 3. Load modifier_options
-      final optionsResult = await SupabaseService.select(
-        'modifier_options',
-        filters: {'outlet_id': outletId, 'active': true},
-        orderBy: 'sort_order',
-        ascending: true,
-      );
-
-      if (!optionsResult.isSuccess) {
-        debugPrint('❌ Failed to load modifier options: ${optionsResult.error}');
-        return false;
-      }
-
-      final options = optionsResult.data!
-          .map((json) => ModifierOption.fromJson(json))
-          .toList();
-
-      debugPrint('   Loaded ${options.length} modifier options');
 
       _optionsByGroupId.clear();
       for (final option in options) {
@@ -158,6 +179,61 @@ class ModifierService {
       debugPrint('❌ ModifierService: Error loading modifiers: $e');
       debugPrint('Stack: $stackTrace');
       return false;
+    }
+  }
+
+  /// Load modifiers from local mirror tables
+  Future<Map<String, List<dynamic>>?> _loadModifiersFromLocalMirror(String outletId) async {
+    debugPrint('  📂 Reading from local mirror tables: modifier_groups, modifier_options, product_modifier_groups');
+
+    try {
+      final db = await _db.database;
+
+      // Load product_modifier_groups links
+      final linksResults = await db.query(
+        'product_modifier_groups',
+        where: 'outlet_id = ? AND active = ?',
+        whereArgs: [outletId, 1],
+        orderBy: 'sort_order',
+      );
+
+      // Load modifier_groups
+      final groupsResults = await db.query(
+        'modifier_groups',
+        where: 'outlet_id = ? AND active = ?',
+        whereArgs: [outletId, 1],
+        orderBy: 'sort_order',
+      );
+
+      // Load modifier_options
+      final optionsResults = await db.query(
+        'modifier_options',
+        where: 'outlet_id = ? AND active = ?',
+        whereArgs: [outletId, 1],
+        orderBy: 'sort_order',
+      );
+
+      // If all empty, return null to trigger fallback
+      if (linksResults.isEmpty && groupsResults.isEmpty && optionsResults.isEmpty) {
+        debugPrint('  ⚠️ Local mirror tables empty for modifiers');
+        return null;
+      }
+
+      // Parse results
+      final links = linksResults.map((json) => ProductModifierGroupLink.fromJson(json)).toList();
+      final groups = groupsResults.map((json) => ModifierGroup.fromJson(json)).toList();
+      final options = optionsResults.map((json) => ModifierOption.fromJson(json)).toList();
+
+      debugPrint('  ✅ Local mirror has ${links.length} links, ${groups.length} groups, ${options.length} options');
+
+      return {
+        'links': links,
+        'groups': groups,
+        'options': options,
+      };
+    } catch (e) {
+      debugPrint('  ❌ Failed to read from local mirror: $e');
+      return null;
     }
   }
 

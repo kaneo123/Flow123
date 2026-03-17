@@ -12,6 +12,7 @@ import 'package:flowtill/models/outlet_settings.dart' as models;
 import 'package:flowtill/models/tax_rate.dart' as models;
 import 'package:flowtill/models/promotion.dart' as models;
 import 'package:flowtill/services/loyalty_service.dart';
+import 'package:flowtill/config/sync_config.dart';
 
 enum SyncStatus {
   idle,
@@ -66,25 +67,37 @@ class SyncService {
   Future<void> initialize() async {
     await _connectionService.initialize();
     
-    // Listen to connection changes
-    _connectionService.connectionStream.listen((isOnline) {
-      if (isOnline) {
-        debugPrint('🔄 Connection restored - triggering sync');
-        syncAll();
-      } else {
-        debugPrint('📴 Connection lost - sync paused');
-      }
-    });
+    // Listen to connection changes (only if auto-sync is enabled)
+    if (kSyncOnConnectionRestore) {
+      _connectionService.connectionStream.listen((isOnline) {
+        if (isOnline) {
+          debugPrint('🔄 Connection restored - triggering sync');
+          syncAll();
+        } else {
+          debugPrint('📴 Connection lost - sync paused');
+        }
+      });
+    } else {
+      debugPrint('🔄 SyncService: Automatic sync on connection restore is DISABLED');
+    }
 
-    // Start periodic sync timer (every 2 minutes when online)
-    _syncTimer = Timer.periodic(const Duration(minutes: 2), (_) {
-      if (_connectionService.isOnline && !_isSyncing) {
-        syncAll();
-      }
-    });
+    // Start periodic sync timer (only if enabled)
+    if (kPeriodicBackgroundSync) {
+      _syncTimer = Timer.periodic(const Duration(minutes: 2), (_) {
+        if (_connectionService.isOnline && !_isSyncing) {
+          syncAll();
+        }
+      });
+      debugPrint('🔄 SyncService: Periodic background sync is ENABLED (every 2 minutes)');
+    } else {
+      debugPrint('🔄 SyncService: Periodic background sync is DISABLED');
+    }
 
-    // Note: Initial sync is triggered lazily when outlet is selected (see OutletProvider)
-    debugPrint('🔄 SyncService initialized (lazy loading enabled)');
+    // Note: Content sync is controlled by kAutoContentSyncOnStartup flag
+    debugPrint('🔄 SyncService initialized');
+    debugPrint('   Auto content sync on startup: $kAutoContentSyncOnStartup');
+    debugPrint('   Periodic background sync: $kPeriodicBackgroundSync');
+    debugPrint('   Sync on connection restore: $kSyncOnConnectionRestore');
   }
 
   void _updateStatus(SyncStatus status) {

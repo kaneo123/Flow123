@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 class Printer {
   final String id;
   final String outletId;
@@ -40,15 +42,15 @@ class Printer {
     type: json['type'] as String? ?? 'other',
     connectionType: json['connection_type'] as String? ?? 'other',
     ipAddress: json['ip_address'] as String?,
-    port: json['port'] as int?,
+    port: SQLiteConverters.toInt(json['port']),
     hardwareVendorId: json['hardware_vendor_id'] as String?,
     hardwareProductId: json['hardware_product_id'] as String?,
     hardwareAddress: json['hardware_address'] as String?,
     hardwareName: json['hardware_name'] as String?,
     paperSize: json['paper_size'] as String? ?? '80mm',
-    isDefaultReceipt: json['is_default_receipt'] as bool? ?? false,
-    active: json['active'] as bool? ?? true,
-    createdAt: json['created_at'] != null ? DateTime.tryParse(json['created_at'] as String) : null,
+    isDefaultReceipt: SQLiteConverters.toBool(json['is_default_receipt']) ?? false,
+    active: SQLiteConverters.toBool(json['active']) ?? true,
+    createdAt: SQLiteConverters.toDateTime(json['created_at']),
   );
 
   Map<String, dynamic> toJson() => {

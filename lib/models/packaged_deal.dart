@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flowtill/utils/sqlite_converters.dart';
 
 class PackagedDeal {
   final String id;
@@ -74,20 +75,16 @@ class PackagedDeal {
       outletId: json['outlet_id'] as String,
       name: json['name'] as String,
       description: json['description'] as String?,
-      price: double.parse(json['price'].toString()),
+      price: SQLiteConverters.toDouble(json['price']) ?? 0.0,
       components: parsedComponents,
-      active: json['active'] as bool? ?? true,
+      active: SQLiteConverters.toBool(json['active']) ?? true,
       availableDays: parsedDays,
       startTime: json['start_time'] as String?,
       endTime: json['end_time'] as String?,
-      startDate: json['start_date'] != null
-          ? DateTime.parse(json['start_date'] as String)
-          : null,
-      endDate: json['end_date'] != null
-          ? DateTime.parse(json['end_date'] as String)
-          : null,
-      createdAt: DateTime.parse(json['created_at'] as String),
-      updatedAt: DateTime.parse(json['updated_at'] as String),
+      startDate: SQLiteConverters.toDateTime(json['start_date']),
+      endDate: SQLiteConverters.toDateTime(json['end_date']),
+      createdAt: SQLiteConverters.toDateTime(json['created_at']) ?? DateTime.now(),
+      updatedAt: SQLiteConverters.toDateTime(json['updated_at']) ?? DateTime.now(),
     );
   }
 

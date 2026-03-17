@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 class Product {
   final String id;
   final String outletId;
@@ -41,17 +43,17 @@ class Product {
     categoryId: json['category_id'] as String?,
     name: json['name'] as String? ?? '',
     plu: json['plu'] as String?,
-    price: (json['price'] as num?)?.toDouble() ?? 0.0,
+    price: SQLiteConverters.toDouble(json['price']) ?? 0.0,
     taxRateId: json['tax_rate_id'] as String?,
     course: json['course'] as String?,
     printerId: json['printer_id'] as String?,
-    active: json['active'] as bool? ?? true,
-    sortOrder: json['sort_order'] as int? ?? 0,
-    trackStock: json['track_stock'] as bool? ?? false,
-    autoHideWhenOutOfStock: json['auto_hide_when_out_of_stock'] as bool? ?? false,
+    active: SQLiteConverters.toBool(json['active']) ?? true,
+    sortOrder: SQLiteConverters.toInt(json['sort_order']) ?? 0,
+    trackStock: SQLiteConverters.toBool(json['track_stock']) ?? false,
+    autoHideWhenOutOfStock: SQLiteConverters.toBool(json['auto_hide_when_out_of_stock']) ?? false,
     linkedInventoryItemId: json['linked_inventory_item_id'] as String?,
-    createdAt: json['created_at'] != null ? DateTime.tryParse(json['created_at'] as String) : null,
-    isCarvery: json['is_carvery'] as bool? ?? false,
+    createdAt: SQLiteConverters.toDateTime(json['created_at']),
+    isCarvery: SQLiteConverters.toBool(json['is_carvery']) ?? false,
   );
 
   Map<String, dynamic> toJson() => {

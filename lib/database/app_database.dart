@@ -52,7 +52,7 @@ class AppDatabase {
     
     return await openDatabase(
       dbPath,
-      version: 5,
+      version: 7,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -92,17 +92,30 @@ class AppDatabase {
       )
     ''');
 
-    // Staff table
+    // Staff table (no longer has outlet_id - uses staff_outlets junction table)
     await db.execute('''
       CREATE TABLE staff (
         id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        pin TEXT NOT NULL,
+        full_name TEXT NOT NULL,
+        pin_code TEXT NOT NULL,
         active INTEGER NOT NULL DEFAULT 1,
         associated_outlets TEXT,
         role_id TEXT,
         permission_level INTEGER,
         updated_at INTEGER NOT NULL
+      )
+    ''');
+
+    // Staff outlets junction table (many-to-many relationship)
+    await db.execute('''
+      CREATE TABLE staff_outlets (
+        id TEXT PRIMARY KEY,
+        staff_id TEXT NOT NULL,
+        outlet_id TEXT NOT NULL,
+        role_id TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        UNIQUE(staff_id, outlet_id)
       )
     ''');
 
@@ -248,6 +261,9 @@ class AppDatabase {
     await db.execute('CREATE INDEX idx_outbox_created ON outbox_queue(created_at ASC)');
     await db.execute('CREATE INDEX idx_till_adjustments_outlet ON till_adjustments(outlet_id)');
     await db.execute('CREATE INDEX idx_till_adjustments_timestamp ON till_adjustments(timestamp DESC)');
+    await db.execute('CREATE INDEX idx_staff_outlets_staff ON staff_outlets(staff_id)');
+    await db.execute('CREATE INDEX idx_staff_outlets_outlet ON staff_outlets(outlet_id)');
+    await db.execute('CREATE INDEX idx_staff_outlets_outlet_role ON staff_outlets(outlet_id, role_id)');
 
     debugPrint('AppDatabase: Database created successfully');
   }
@@ -324,6 +340,62 @@ class AppDatabase {
       await db.execute('ALTER TABLE staff ADD COLUMN role_id TEXT');
       await db.execute('ALTER TABLE staff ADD COLUMN permission_level INTEGER');
       debugPrint('✅ AppDatabase: Added outlet association columns to staff table');
+    }
+
+    if (oldVersion < 6) {
+      // Create staff_outlets junction table for many-to-many relationship
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS staff_outlets (
+          id TEXT PRIMARY KEY,
+          staff_id TEXT NOT NULL,
+          outlet_id TEXT NOT NULL,
+          role_id TEXT,
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL,
+          UNIQUE(staff_id, outlet_id)
+        )
+      ''');
+      
+      // Create indexes for staff_outlets table
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_staff_outlets_staff ON staff_outlets(staff_id)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_staff_outlets_outlet ON staff_outlets(outlet_id)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_staff_outlets_outlet_role ON staff_outlets(outlet_id, role_id)');
+      
+      debugPrint('✅ AppDatabase: Created staff_outlets junction table');
+    }
+
+    if (oldVersion < 7) {
+      // Migrate staff table to use current schema field names: full_name and pin_code
+      debugPrint('🔄 AppDatabase: Migrating staff table to use full_name and pin_code');
+      
+      // Create new staff table with correct schema
+      await db.execute('''
+        CREATE TABLE staff_new (
+          id TEXT PRIMARY KEY,
+          full_name TEXT NOT NULL,
+          pin_code TEXT NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          associated_outlets TEXT,
+          role_id TEXT,
+          permission_level INTEGER,
+          updated_at INTEGER NOT NULL
+        )
+      ''');
+      
+      // Copy existing data
+      await db.execute('''
+        INSERT INTO staff_new (id, full_name, pin_code, active, associated_outlets, role_id, permission_level, updated_at)
+        SELECT id, name, pin, active, associated_outlets, role_id, permission_level, updated_at
+        FROM staff
+      ''');
+      
+      // Drop old table
+      await db.execute('DROP TABLE staff');
+      
+      // Rename new table
+      await db.execute('ALTER TABLE staff_new RENAME TO staff');
+      
+      debugPrint('✅ AppDatabase: Staff table migrated to use full_name and pin_code');
     }
   }
 
@@ -403,7 +475,7 @@ class AppDatabase {
 
   Future<Map<String, dynamic>?> getStaffByPin(String pin) async {
     final db = await database;
-    final results = await db.query('staff', where: 'pin = ? AND active = 1', whereArgs: [pin]);
+    final results = await db.query('staff', where: 'pin_code = ? AND active = 1', whereArgs: [pin]);
     return results.isNotEmpty ? results.first : null;
   }
 

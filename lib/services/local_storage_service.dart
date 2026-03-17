@@ -76,4 +76,11 @@ class LocalStorageService {
   }
 
   bool getHideTopAppBar() => prefs.getBool('hide_top_app_bar') ?? false;
+
+  // Last selected outlet for startup content sync
+  Future<void> saveLastSelectedOutletId(String outletId) async {
+    await prefs.setString('last_selected_outlet_id', outletId);
+  }
+
+  String? getLastSelectedOutletId() => prefs.getString('last_selected_outlet_id');
 }

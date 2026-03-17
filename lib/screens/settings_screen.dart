@@ -9,8 +9,10 @@ import 'package:flowtill/services/printer/printer_service.dart';
 import 'package:flowtill/services/sync_service.dart';
 import 'package:flowtill/services/connection_service.dart';
 import 'package:flowtill/services/local_storage_service.dart';
+import 'package:flowtill/services/mirror_content_sync_service.dart';
 import 'package:flowtill/database/app_database.dart';
 import 'package:flowtill/config/admin_config.dart';
+import 'package:flowtill/screens/mirror_diagnostics_screen.dart';
 import 'package:intl/intl.dart';
 
 class SettingsScreen extends StatelessWidget {
@@ -151,6 +153,16 @@ class SettingsScreen extends StatelessWidget {
                     const SizedBox(height: AppSpacing.md),
                     _SettingsCard(
                       child: _SyncStatusPanel(),
+                    ),
+                    const SizedBox(height: AppSpacing.xl),
+                  ],
+
+                  // Dev Settings - Local Mirror Tools
+                  if (!kIsWeb) ...[
+                    _SectionHeader(title: 'Dev Settings - Local Mirror Tools'),
+                    const SizedBox(height: AppSpacing.md),
+                    _SettingsCard(
+                      child: _LocalMirrorToolsPanel(),
                     ),
                     const SizedBox(height: AppSpacing.xl),
                   ],
@@ -1934,3 +1946,386 @@ class _SettingRow extends StatelessWidget {
     );
   }
 }
+
+/// Local Mirror Tools Panel - Dev Settings for managing local SQLite mirrors
+class _LocalMirrorToolsPanel extends StatefulWidget {
+  @override
+  State<_LocalMirrorToolsPanel> createState() => _LocalMirrorToolsPanelState();
+}
+
+class _LocalMirrorToolsPanelState extends State<_LocalMirrorToolsPanel> {
+  final _mirrorService = MirrorContentSyncService();
+  bool _isSyncing = false;
+  String? _lastSyncResult;
+
+  Future<void> _syncAllMirrorContent() async {
+    final outletProvider = context.read<OutletProvider>();
+    final outletId = outletProvider.currentOutlet?.id;
+
+    if (outletId == null) {
+      _showErrorSnackbar('No outlet selected');
+      return;
+    }
+
+    setState(() => _isSyncing = true);
+
+    try {
+      debugPrint('[LOCAL_MIRROR] Starting sync all mirror content');
+      final result = await _mirrorService.syncAllMirrorContent(outletId);
+
+      if (result.success) {
+        setState(() => _lastSyncResult = '✅ Synced ${result.totalRows} rows from ${result.tableResults.length} tables');
+        _showSuccessSnackbar('Synced ${result.totalRows} rows successfully');
+      } else {
+        setState(() => _lastSyncResult = '❌ Sync failed: ${result.error}');
+        _showErrorSnackbar('Sync failed: ${result.error}');
+      }
+    } catch (e) {
+      debugPrint('[LOCAL_MIRROR] Error: $e');
+      setState(() => _lastSyncResult = '❌ Error: $e');
+      _showErrorSnackbar('Sync failed: $e');
+    } finally {
+      setState(() => _isSyncing = false);
+    }
+  }
+
+  Future<void> _syncSingleTable() async {
+    final outletProvider = context.read<OutletProvider>();
+    final outletId = outletProvider.currentOutlet?.id;
+
+    if (outletId == null) {
+      _showErrorSnackbar('No outlet selected');
+      return;
+    }
+
+    // Show table selection dialog
+    final selectedTable = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Select Table to Sync'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: MirrorContentSyncService.availableTables.length,
+            itemBuilder: (context, index) {
+              final tableName = MirrorContentSyncService.availableTables[index];
+              return ListTile(
+                title: Text(tableName),
+                onTap: () => Navigator.of(context).pop(tableName),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+
+    if (selectedTable == null) return;
+
+    setState(() => _isSyncing = true);
+
+    try {
+      debugPrint('[LOCAL_MIRROR] Syncing single table: $selectedTable');
+      final result = await _mirrorService.syncSingleTable(selectedTable, outletId);
+
+      if (result.success) {
+        setState(() => _lastSyncResult = '✅ Synced ${result.rowsSynced} rows from $selectedTable');
+        _showSuccessSnackbar('Synced ${result.rowsSynced} rows from $selectedTable');
+      } else {
+        setState(() => _lastSyncResult = '❌ Sync failed for $selectedTable: ${result.error}');
+        _showErrorSnackbar('Sync failed: ${result.error}');
+      }
+    } catch (e) {
+      debugPrint('[LOCAL_MIRROR] Error: $e');
+      setState(() => _lastSyncResult = '❌ Error: $e');
+      _showErrorSnackbar('Sync failed: $e');
+    } finally {
+      setState(() => _isSyncing = false);
+    }
+  }
+
+  Future<void> _clearAllMirrorContent() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Clear All Mirror Content?'),
+        content: const Text('This will remove all local mirror data (schema will be preserved). Are you sure?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Clear All'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    setState(() => _isSyncing = true);
+
+    try {
+      debugPrint('[LOCAL_MIRROR] Clearing all mirror content');
+      final result = await _mirrorService.clearAllMirrorContent();
+
+      if (result.success) {
+        setState(() => _lastSyncResult = '✅ Cleared ${result.clearedTables} tables');
+        _showSuccessSnackbar('Cleared ${result.clearedTables} tables');
+      } else {
+        setState(() => _lastSyncResult = '❌ Clear failed: ${result.error}');
+        _showErrorSnackbar('Clear failed: ${result.error}');
+      }
+    } catch (e) {
+      debugPrint('[LOCAL_MIRROR] Error: $e');
+      setState(() => _lastSyncResult = '❌ Error: $e');
+      _showErrorSnackbar('Clear failed: $e');
+    } finally {
+      setState(() => _isSyncing = false);
+    }
+  }
+
+  void _openMirrorDiagnostics() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => const MirrorDiagnosticsScreen(),
+      ),
+    );
+  }
+
+  void _showSuccessSnackbar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.check_circle, color: Colors.white),
+            const SizedBox(width: 8),
+            Expanded(child: Text(message)),
+          ],
+        ),
+        backgroundColor: Colors.green,
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+
+  void _showErrorSnackbar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.error, color: Colors.white),
+            const SizedBox(width: 8),
+            Expanded(child: Text(message)),
+          ],
+        ),
+        backgroundColor: Colors.red,
+        duration: const Duration(seconds: 4),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return Padding(
+      padding: AppSpacing.paddingLg,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header
+          Row(
+            children: [
+              Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: colorScheme.tertiaryContainer,
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                ),
+                child: Icon(
+                  Icons.storage,
+                  color: colorScheme.onTertiaryContainer,
+                ),
+              ),
+              const SizedBox(width: AppSpacing.md),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Local Mirror Tools',
+                      style: context.textStyles.titleMedium?.semiBold,
+                    ),
+                    Text(
+                      'Manually manage local SQLite mirrors',
+                      style: context.textStyles.bodySmall?.copyWith(
+                        color: colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: AppSpacing.lg),
+
+          // Last sync result
+          if (_lastSyncResult != null) ...[
+            Container(
+              padding: AppSpacing.paddingSm,
+              decoration: BoxDecoration(
+                color: _lastSyncResult!.contains('✅') 
+                    ? Colors.green.withValues(alpha: 0.1)
+                    : Colors.orange.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(AppRadius.sm),
+                border: Border.all(
+                  color: _lastSyncResult!.contains('✅')
+                      ? Colors.green.withValues(alpha: 0.3)
+                      : Colors.orange.withValues(alpha: 0.3),
+                ),
+              ),
+              child: Text(
+                _lastSyncResult!,
+                style: context.textStyles.bodySmall,
+              ),
+            ),
+            const SizedBox(height: AppSpacing.md),
+          ],
+
+          // Buttons
+          _MirrorToolButton(
+            icon: Icons.cloud_download,
+            label: 'Sync All Mirror Content',
+            subtitle: 'Download all table data from Supabase',
+            onPressed: _isSyncing ? null : _syncAllMirrorContent,
+            isSyncing: _isSyncing,
+          ),
+
+          const SizedBox(height: AppSpacing.sm),
+
+          _MirrorToolButton(
+            icon: Icons.table_chart,
+            label: 'Sync Single Table',
+            subtitle: 'Download one specific table',
+            onPressed: _isSyncing ? null : _syncSingleTable,
+            isSyncing: _isSyncing,
+          ),
+
+          const SizedBox(height: AppSpacing.sm),
+
+          _MirrorToolButton(
+            icon: Icons.info_outline,
+            label: 'Open Mirror Diagnostics Page',
+            subtitle: 'View detailed per-table status and controls',
+            onPressed: _isSyncing ? null : _openMirrorDiagnostics,
+            isSyncing: false,
+          ),
+
+          const SizedBox(height: AppSpacing.sm),
+
+          _MirrorToolButton(
+            icon: Icons.delete_outline,
+            label: 'Clear Local Mirror Content',
+            subtitle: 'Remove all local data (keeps schema)',
+            onPressed: _isSyncing ? null : _clearAllMirrorContent,
+            isSyncing: _isSyncing,
+            isDanger: true,
+          ),
+
+          const SizedBox(height: AppSpacing.md),
+
+          // Help text
+          Text(
+            'Manual sync tools for development. Schema sync runs automatically on startup.',
+            style: context.textStyles.bodySmall?.copyWith(
+              color: colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MirrorToolButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String subtitle;
+  final VoidCallback? onPressed;
+  final bool isSyncing;
+  final bool isDanger;
+
+  const _MirrorToolButton({
+    required this.icon,
+    required this.label,
+    required this.subtitle,
+    required this.onPressed,
+    this.isSyncing = false,
+    this.isDanger = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return SizedBox(
+      width: double.infinity,
+      child: OutlinedButton(
+        onPressed: onPressed,
+        style: OutlinedButton.styleFrom(
+          padding: const EdgeInsets.all(16),
+          side: BorderSide(
+            color: isDanger 
+                ? Colors.red.withValues(alpha: 0.5)
+                : colorScheme.outline.withValues(alpha: 0.3),
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              icon,
+              color: isDanger ? Colors.red : colorScheme.primary,
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: context.textStyles.titleSmall?.semiBold.copyWith(
+                      color: isDanger ? Colors.red : null,
+                    ),
+                  ),
+                  Text(
+                    subtitle,
+                    style: context.textStyles.bodySmall?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (isSyncing)
+              const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+

@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 enum PromotionDiscountType {
   percent,
   fixedAmount,
@@ -108,21 +110,17 @@ class Promotion {
       name: json['name'] as String,
       discountType: PromotionDiscountType.fromString(json['discount_type'] as String),
       scope: PromotionScope.fromString(json['scope'] as String),
-      discountValue: (json['discount_value'] as num?)?.toDouble(),
-      xQty: json['x_qty'] as int?,
-      yQty: json['y_qty'] as int?,
-      startDateTime: json['start_datetime'] != null 
-          ? DateTime.parse(json['start_datetime'] as String) 
-          : null,
-      endDateTime: json['end_datetime'] != null 
-          ? DateTime.parse(json['end_datetime'] as String) 
-          : null,
+      discountValue: SQLiteConverters.toDouble(json['discount_value']),
+      xQty: SQLiteConverters.toInt(json['x_qty']),
+      yQty: SQLiteConverters.toInt(json['y_qty']),
+      startDateTime: SQLiteConverters.toDateTime(json['start_datetime']),
+      endDateTime: SQLiteConverters.toDateTime(json['end_datetime']),
       daysOfWeek: json['days_of_week'] != null
           ? (json['days_of_week'] as List<dynamic>).cast<int>()
           : null,
-      active: json['active'] as bool? ?? true,
-      createdAt: DateTime.parse(json['created_at'] as String),
-      updatedAt: DateTime.parse(json['updated_at'] as String),
+      active: SQLiteConverters.toBool(json['active']) ?? true,
+      createdAt: SQLiteConverters.toDateTime(json['created_at']) ?? DateTime.now(),
+      updatedAt: SQLiteConverters.toDateTime(json['updated_at']) ?? DateTime.now(),
     );
   }
 

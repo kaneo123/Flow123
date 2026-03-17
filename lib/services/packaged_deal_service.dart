@@ -2,45 +2,70 @@ import 'package:flutter/foundation.dart';
 import 'package:flowtill/models/packaged_deal.dart';
 import 'package:flowtill/models/packaged_deal_component.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
+import 'package:flowtill/database/app_database.dart';
+import 'package:flowtill/config/sync_config.dart';
 
 class PackagedDealService {
   final _supabase = SupabaseConfig.client;
+  final AppDatabase _db = AppDatabase.instance;
 
   List<PackagedDeal> _cachedDeals = [];
   Map<String, List<PackagedDealComponent>> _dealComponents = {}; // dealId -> [components]
 
-  /// Load all active packaged deals for the given outlet from Supabase
+  /// Load all active packaged deals for the given outlet (local-first when flag enabled)
   Future<void> loadActiveDeals(String outletId) async {
     try {
       debugPrint('📦 PackagedDealService: Loading packaged deals for outlet $outletId');
 
-      // First, check ALL deals in the database to help diagnose outlet mismatches
-      final allDealsInDb = await _supabase
-          .from('packaged_deals')
-          .select()
-          .eq('active', true);
-      debugPrint('   📊 Total active deals in database (all outlets): ${allDealsInDb.length}');
-      if (allDealsInDb.isNotEmpty) {
-        for (final dealData in allDealsInDb) {
-          final deal = dealData as Map<String, dynamic>;
-          debugPrint('      - "${deal['name']}" @ £${deal['price']} | Outlet: ${deal['outlet_id']}');
+      List<dynamic> dealsData = [];
+      List<dynamic> componentsData = [];
+      bool usedLocal = false;
+
+      // Step 3: LOCAL MIRROR FIRST (when feature flag is enabled)
+      if (kUseLocalMirrorReads && !kIsWeb) {
+        debugPrint('[LOCAL_MIRROR] PackagedDealService: Trying local mirror first');
+        
+        final localResult = await _loadDealsFromLocalMirror(outletId);
+        if (localResult != null) {
+          dealsData = localResult['deals']!;
+          componentsData = localResult['components']!;
+          usedLocal = true;
+          debugPrint('[LOCAL_MIRROR] ✅ Using local data for packaged_deals (${dealsData.length} deals, ${componentsData.length} components, source=local)');
+        } else {
+          debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for packaged_deals');
         }
       }
 
-      // ⚡ PARALLEL FETCH: Load all deal data simultaneously
-      final results = await Future.wait([
-        _supabase
+      // Load from Supabase if not using local
+      if (!usedLocal) {
+        // First, check ALL deals in the database to help diagnose outlet mismatches
+        final allDealsInDb = await _supabase
             .from('packaged_deals')
             .select()
-            .eq('outlet_id', outletId)
-            .eq('active', true),
-        _supabase
-            .from('packaged_deal_components')
-            .select(),
-      ]);
+            .eq('active', true);
+        debugPrint('   📊 Total active deals in database (all outlets): ${allDealsInDb.length} (source=supabase)');
+        if (allDealsInDb.isNotEmpty) {
+          for (final dealData in allDealsInDb) {
+            final deal = dealData as Map<String, dynamic>;
+            debugPrint('      - "${deal['name']}" @ £${deal['price']} | Outlet: ${deal['outlet_id']}');
+          }
+        }
 
-      final dealsData = results[0] as List<dynamic>;
-      final componentsData = results[1] as List<dynamic>;
+        // ⚡ PARALLEL FETCH: Load all deal data simultaneously
+        final results = await Future.wait([
+          _supabase
+              .from('packaged_deals')
+              .select()
+              .eq('outlet_id', outletId)
+              .eq('active', true),
+          _supabase
+              .from('packaged_deal_components')
+              .select(),
+        ]);
+
+        dealsData = results[0] as List<dynamic>;
+        componentsData = results[1] as List<dynamic>;
+      }
 
       _cachedDeals = dealsData
           .map((json) => PackagedDeal.fromJson(json as Map<String, dynamic>))
@@ -72,6 +97,41 @@ class PackagedDealService {
       debugPrint('Stack: $stackTrace');
       _cachedDeals = [];
       _dealComponents.clear();
+    }
+  }
+
+  /// Load packaged deals from local mirror tables
+  Future<Map<String, List<dynamic>>?> _loadDealsFromLocalMirror(String outletId) async {
+    debugPrint('  📂 Reading from local mirror tables: packaged_deals, packaged_deal_components');
+
+    try {
+      final db = await _db.database;
+
+      // Load packaged_deals
+      final dealsResults = await db.query(
+        'packaged_deals',
+        where: 'outlet_id = ? AND active = ?',
+        whereArgs: [outletId, 1],
+      );
+
+      // Load packaged_deal_components (all components, will filter by deal)
+      final componentsResults = await db.query('packaged_deal_components');
+
+      // If deals empty, return null to trigger fallback
+      if (dealsResults.isEmpty) {
+        debugPrint('  ⚠️ Local mirror table empty: packaged_deals');
+        return null;
+      }
+
+      debugPrint('  ✅ Local mirror has ${dealsResults.length} deals, ${componentsResults.length} components');
+
+      return {
+        'deals': dealsResults,
+        'components': componentsResults,
+      };
+    } catch (e) {
+      debugPrint('  ❌ Failed to read from local mirror: $e');
+      return null;
     }
   }
 

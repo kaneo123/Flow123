@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:flowtill/utils/sqlite_converters.dart';
 
 class Outlet {
   final String id;
@@ -79,7 +80,7 @@ class Outlet {
       final town = json['town']?.toString();
       final postcode = json['postcode']?.toString();
       final phone = json['phone']?.toString();
-      final active = json['active'] == true;
+      final active = SQLiteConverters.toBool(json['active']) ?? true;
       
       // Parse settings (JSONB field) - only if present
       Map<String, dynamic>? settings;
@@ -90,22 +91,22 @@ class Outlet {
       }
       
       // Parse service charge fields
-      final enableServiceCharge = json['enable_service_charge'] == true;
-      final serviceChargePercent = (json['service_charge_percent'] as num?)?.toDouble() ?? 0.0;
+      final enableServiceCharge = SQLiteConverters.toBool(json['enable_service_charge']) ?? false;
+      final serviceChargePercent = SQLiteConverters.toDouble(json['service_charge_percent']) ?? 0.0;
       
       // Parse receipt formatting fields
       final receiptHeaderText = json['receipt_header_text']?.toString() ?? '';
       final receiptFooterText = json['receipt_footer_text']?.toString() ?? '';
-      final receiptShowLogo = json['receipt_show_logo'] == true;
+      final receiptShowLogo = SQLiteConverters.toBool(json['receipt_show_logo']) ?? false;
       final receiptLogoUrl = json['receipt_logo_url']?.toString();
-      final receiptFontSize = (json['receipt_font_size'] as num?)?.toInt() ?? 20;
-      final receiptLineSpacing = (json['receipt_line_spacing'] as num?)?.toInt() ?? 4;
-      final receiptShowVatBreakdown = json['receipt_show_vat_breakdown'] != false;
-      final receiptShowServiceCharge = json['receipt_show_service_charge'] != false;
-      final receiptShowPromotions = json['receipt_show_promotions'] != false;
-      final receiptUseCompactLayout = json['receipt_use_compact_layout'] != false;
+      final receiptFontSize = SQLiteConverters.toInt(json['receipt_font_size']) ?? 20;
+      final receiptLineSpacing = SQLiteConverters.toInt(json['receipt_line_spacing']) ?? 4;
+      final receiptShowVatBreakdown = SQLiteConverters.toBool(json['receipt_show_vat_breakdown']) ?? true;
+      final receiptShowServiceCharge = SQLiteConverters.toBool(json['receipt_show_service_charge']) ?? true;
+      final receiptShowPromotions = SQLiteConverters.toBool(json['receipt_show_promotions']) ?? true;
+      final receiptUseCompactLayout = SQLiteConverters.toBool(json['receipt_use_compact_layout']) ?? true;
       final receiptCodepage = json['receipt_codepage']?.toString() ?? 'CP437';
-      final receiptLargeTotalText = json['receipt_large_total_text'] != false;
+      final receiptLargeTotalText = SQLiteConverters.toBool(json['receipt_large_total_text']) ?? true;
       
       debugPrint('🏪 Outlet.fromJson: Parsing outlet "$name"');
       debugPrint('   enable_service_charge (raw): ${json['enable_service_charge']}');
@@ -114,23 +115,12 @@ class Outlet {
       debugPrint('   service_charge_percent (parsed): $serviceChargePercent');
       
       // Parse timestamps safely
-      DateTime createdAt = DateTime.now();
-      if (json['created_at'] != null) {
-        try {
-          createdAt = DateTime.parse(json['created_at'].toString());
-        } catch (e) {
-          debugPrint('⚠️ Outlet.fromJson: Invalid created_at timestamp: ${json['created_at']}');
-        }
-      }
+      DateTime createdAt = SQLiteConverters.toDateTime(json['created_at']) ?? DateTime.now();
       
       // Parse updated_at only if column exists
       DateTime? updatedAt;
       if (json.containsKey('updated_at') && json['updated_at'] != null) {
-        try {
-          updatedAt = DateTime.parse(json['updated_at'].toString());
-        } catch (e) {
-          debugPrint('⚠️ Outlet.fromJson: Invalid updated_at timestamp: ${json['updated_at']}');
-        }
+        updatedAt = SQLiteConverters.toDateTime(json['updated_at']);
       }
       
       return Outlet(

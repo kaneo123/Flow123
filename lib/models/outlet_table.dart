@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 class OutletTable {
   final String id;
   final String outletId;
@@ -92,15 +94,15 @@ class OutletTable {
       id: json['id'] as String,
       outletId: json['outlet_id'] as String,
       roomName: json['room_name'] as String,
-      roomNumber: json['room_number'] as int?,
+      roomNumber: SQLiteConverters.toInt(json['room_number']),
       tableNumber: tableNumber,
-      capacity: json['capacity'] as int?,
-      active: json['active'] as bool? ?? true,
-      sortOrder: json['sort_order'] as int? ?? 0,
-      posX: json.containsKey('pos_x') ? (json['pos_x'] as num?)?.toDouble() : null,
-      posY: json.containsKey('pos_y') ? (json['pos_y'] as num?)?.toDouble() : null,
-      createdAt: DateTime.parse(json['created_at'] as String),
-      updatedAt: DateTime.parse(json['updated_at'] as String),
+      capacity: SQLiteConverters.toInt(json['capacity']),
+      active: SQLiteConverters.toBool(json['active']) ?? true,
+      sortOrder: SQLiteConverters.toInt(json['sort_order']) ?? 0,
+      posX: SQLiteConverters.toDouble(json['pos_x']),
+      posY: SQLiteConverters.toDouble(json['pos_y']),
+      createdAt: SQLiteConverters.toDateTime(json['created_at']) ?? DateTime.now(),
+      updatedAt: SQLiteConverters.toDateTime(json['updated_at']) ?? DateTime.now(),
     );
   }
 }

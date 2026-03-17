@@ -10,6 +10,9 @@ import 'package:flowtill/services/local_storage_service.dart';
 import 'package:flowtill/services/printer/printer_helper.dart';
 import 'package:flowtill/services/printer/local_printer_config_service.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
+import 'package:flowtill/database/app_database.dart';
+import 'package:flowtill/config/sync_config.dart';
+import 'package:flowtill/services/outlet_service.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_pos_printer_platform_image_3_sdt/flutter_pos_printer_platform_image_3_sdt.dart';
 import 'package:intl/intl.dart';
@@ -33,6 +36,7 @@ class PrinterService {
 
   final LocalStorageService _storage = LocalStorageService();
   final LocalPrinterConfigService _localConfig = LocalPrinterConfigService.instance;
+  final AppDatabase _db = AppDatabase.instance;
 
   // Storage keys
   static const String _autoPrintReceiptKey = 'printer_auto_print_receipt';
@@ -47,34 +51,54 @@ class PrinterService {
   List<models.Printer> _barPrinters = [];
   String? _currentOutletId;
 
-  /// Load all printers for the current outlet from Supabase
+  /// Load all printers for the current outlet (local-first when flag enabled)
   /// Also loads local hardware configurations for this device
   Future<void> loadPrinters(String outletId) async {
     try {
       debugPrint('🖨️ Loading printers for outlet: $outletId');
 
-      // Load logical printers from Supabase
-      final result = await SupabaseService.select(
-        'printers',
-        filters: {'outlet_id': outletId, 'active': true},
-        orderBy: 'name',
-        ascending: true,
-      );
+      List<Map<String, dynamic>>? printerData;
 
-      if (!result.isSuccess || result.data == null) {
-        debugPrint('❌ Failed to load printers: ${result.error}');
-        _clearCache();
-        return;
+      // Step 3: LOCAL MIRROR FIRST (when feature flag is enabled)
+      if (kUseLocalMirrorReads && !kIsWeb) {
+        debugPrint('[LOCAL_MIRROR] PrinterService: Trying local mirror first');
+        
+        final localResult = await _getPrintersFromLocalMirror(outletId);
+        if (localResult.isSuccess && localResult.data != null && localResult.data!.isNotEmpty) {
+          debugPrint('[LOCAL_MIRROR] ✅ Using local data for printers (${localResult.data!.length} records, source=local)');
+          printerData = localResult.data;
+        } else {
+          debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for printers');
+        }
+      }
+
+      // Load from Supabase if local mirror not used or empty
+      if (printerData == null) {
+        final result = await SupabaseService.select(
+          'printers',
+          filters: {'outlet_id': outletId, 'active': true},
+          orderBy: 'name',
+          ascending: true,
+        );
+
+        if (!result.isSuccess || result.data == null) {
+          debugPrint('❌ Failed to load printers: ${result.error}');
+          _clearCache();
+          return;
+        }
+
+        debugPrint('🖨️ Loaded printers from Supabase (source=supabase)');
+        printerData = result.data;
       }
 
       // Load local hardware configurations
       await _localConfig.loadConfigurations();
 
       // Migrate hardware configs from Supabase if this is first run
-      await _localConfig.migrateFromSupabase(result.data!);
+      await _localConfig.migrateFromSupabase(printerData!);
 
       _currentOutletId = outletId;
-      _allPrinters = result.data!.map((json) => models.Printer.fromJson(json)).toList();
+      _allPrinters = printerData.map((json) => models.Printer.fromJson(json)).toList();
       _printersById = {for (var p in _allPrinters) p.id: p};
       _receiptPrinters = _allPrinters.where((p) => p.type == 'receipt').toList();
       _kitchenPrinters = _allPrinters.where((p) => p.type == 'kitchen').toList();
@@ -101,6 +125,32 @@ class PrinterService {
       debugPrint('❌ Error loading printers: $e');
       debugPrint('Stack: $stackTrace');
       _clearCache();
+    }
+  }
+
+  /// Get printers from local mirror table
+  Future<ServiceResult<List<Map<String, dynamic>>>> _getPrintersFromLocalMirror(String outletId) async {
+    debugPrint('  📂 Reading from local mirror table: printers');
+
+    try {
+      final db = await _db.database;
+      final results = await db.query(
+        'printers',
+        where: 'outlet_id = ? AND active = ?',
+        whereArgs: [outletId, 1],
+        orderBy: 'name',
+      );
+
+      if (results.isEmpty) {
+        debugPrint('  ⚠️ Local mirror table empty: printers');
+        return ServiceResult.failure('Local mirror table empty');
+      }
+
+      debugPrint('  ✅ Local mirror has ${results.length} printers');
+      return ServiceResult.success(results);
+    } catch (e) {
+      debugPrint('  ❌ Failed to read from local mirror: $e');
+      return ServiceResult.failure('Failed to read local mirror: ${e.toString()}');
     }
   }
 

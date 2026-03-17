@@ -4,6 +4,7 @@ import 'package:flowtill/database/app_database.dart';
 import 'package:flowtill/services/outlet_service.dart';
 import 'package:flowtill/services/connection_service.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
+import 'package:flowtill/config/sync_config.dart';
 
 class ProductService {
   final AppDatabase _db = AppDatabase.instance;
@@ -52,8 +53,22 @@ class ProductService {
   }
 
   Future<ServiceResult<List<models.Product>>> getProductsForOutlet(String outletId) async {
-    // Online-first (with special handling for web)
+    // Step 3: LOCAL MIRROR FIRST (when feature flag is enabled)
+    if (kUseLocalMirrorReads && !kIsWeb) {
+      debugPrint('[LOCAL_MIRROR] ProductService: Trying local mirror first for outlet: $outletId');
+      
+      final localResult = await _getProductsFromLocalMirror(outletId);
+      if (localResult.isSuccess && localResult.data != null && localResult.data!.isNotEmpty) {
+        debugPrint('[LOCAL_MIRROR] ✅ Using local data for products (${localResult.data!.length} records, source=local)');
+        return localResult;
+      }
+      
+      debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for products');
+    }
+
+    // Original online-first (with special handling for web)
     if (kIsWeb || _connectionService.isOnline) {
+      debugPrint('🛍️ ProductService: Fetching from Supabase (source=supabase)');
       try {
         final response = await SupabaseConfig.client
             .from('products')
@@ -103,6 +118,54 @@ class ProductService {
       return ServiceResult.success(products);
     } catch (e) {
       return ServiceResult.failure('Failed to fetch products: ${e.toString()}');
+    }
+  }
+
+  /// Get products from local mirror table
+  Future<ServiceResult<List<models.Product>>> _getProductsFromLocalMirror(String outletId) async {
+    debugPrint('  📂 Reading from local mirror table: products');
+
+    try {
+      final db = await _db.database;
+      final results = await db.query(
+        'products',
+        where: 'outlet_id = ?',
+        whereArgs: [outletId],
+        orderBy: 'sort_order',
+      );
+
+      if (results.isEmpty) {
+        debugPrint('  ⚠️ Local mirror table empty: products');
+        return ServiceResult.failure('Local mirror table empty');
+      }
+
+      final products = results.map((json) {
+        return models.Product(
+          id: json['id'] as String,
+          outletId: json['outlet_id'] as String,
+          name: json['name'] as String,
+          categoryId: json['category_id'] as String?,
+          price: (json['price'] as num).toDouble(),
+          active: (json['active'] as int?) == 1,
+          taxRateId: json['tax_rate_id'] as String?,
+          course: json['course'] as String?,
+          printerId: json['printer_id'] as String?,
+          sortOrder: json['sort_order'] as int? ?? 0,
+          trackStock: (json['track_stock'] as int?) == 1,
+          autoHideWhenOutOfStock: (json['auto_hide_when_out_of_stock'] as int?) == 1,
+          linkedInventoryItemId: json['linked_inventory_item_id'] as String?,
+          createdAt: json['created_at'] != null 
+              ? DateTime.parse(json['created_at'] as String)
+              : null,
+          isCarvery: (json['is_carvery'] as int?) == 1,
+        );
+      }).toList();
+
+      debugPrint('  ✅ Local mirror has ${products.length} products');
+      return ServiceResult.success(products);
+    } catch (e) {
+      debugPrint('  ❌ Failed to read from local mirror: $e');
+      return ServiceResult.failure('Failed to read local mirror: ${e.toString()}');
     }
   }
 

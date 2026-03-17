@@ -8,6 +8,9 @@ import 'package:flowtill/providers/catalog_provider.dart';
 import 'package:flowtill/theme.dart';
 
 /// Full-screen staff login page with PIN entry
+/// Supports 2-step authentication:
+/// 1. Enter PIN → Verify staff identity
+/// 2. Select outlet (if staff has multiple outlets)
 class StaffLoginScreen extends StatefulWidget {
   final VoidCallback onLoginSuccess;
 
@@ -69,6 +72,7 @@ class _StaffLoginContent extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
+    final loginProvider = context.watch<LoginProvider>();
     
     return Scaffold(
       backgroundColor: colorScheme.surface,
@@ -79,7 +83,7 @@ class _StaffLoginContent extends StatelessWidget {
             final availableWidth = constraints.maxWidth;
             final isLandscape = availableWidth > availableHeight;
             
-            // Calculate responsive sizes with tighter constraints
+            // Calculate responsive sizes
             final logoSize = (availableHeight * 0.07).clamp(40.0, 70.0);
             final verticalPadding = (availableHeight * 0.015).clamp(8.0, 16.0);
             final horizontalPadding = (availableWidth * 0.05).clamp(16.0, 40.0);
@@ -192,7 +196,10 @@ class _StaffLoginContent extends StatelessWidget {
             SizedBox(height: elementSpacing * 0.3),
             const _LoadingIndicator(),
             SizedBox(height: elementSpacing),
-            Flexible(child: _NumericKeypad(availableHeight: availableHeight)),
+            Flexible(child: _NumericKeypad(
+              availableHeight: availableHeight,
+              onLoginSuccess: onLoginSuccess,
+            )),
           ],
         ),
       ),
@@ -200,7 +207,7 @@ class _StaffLoginContent extends StatelessWidget {
   }
 }
 
-/// Outlet selector dropdown with comprehensive error handling
+/// Outlet selector dropdown (only shown if no outlet is preselected)
 class _OutletSelector extends StatefulWidget {
   const _OutletSelector();
 
@@ -229,7 +236,7 @@ class _OutletSelectorState extends State<_OutletSelector> {
         child: Row(
           children: [
             const SizedBox(width: AppSpacing.md),
-            SizedBox(
+            const SizedBox(
               width: 20,
               height: 20,
               child: CircularProgressIndicator(strokeWidth: 2),
@@ -492,29 +499,28 @@ class _LoadingIndicator extends StatelessWidget {
   }
 }
 
-/// Numeric keypad (3x4 grid) - Now fully responsive
+/// Numeric keypad (3x4 grid)
 class _NumericKeypad extends StatelessWidget {
   final double availableHeight;
+  final VoidCallback onLoginSuccess;
   
-  const _NumericKeypad({required this.availableHeight});
+  const _NumericKeypad({
+    required this.availableHeight,
+    required this.onLoginSuccess,
+  });
 
   @override
   Widget build(BuildContext context) {
     final loginProvider = context.watch<LoginProvider>();
-    final outletProvider = context.watch<OutletProvider>();
-    final staffProvider = context.read<StaffProvider>();
     
     return LayoutBuilder(
       builder: (context, constraints) {
-        // Calculate button size based on available space with better constraints
         final maxWidth = constraints.maxWidth;
         final maxHeight = constraints.maxHeight;
         
-        // Calculate ideal button size from both width and height
         final widthBasedSize = ((maxWidth / 3) - 16).clamp(50.0, 100.0);
         final heightBasedSize = ((maxHeight / 4.5) - 8).clamp(50.0, 100.0);
         
-        // Use the smaller of the two to ensure it fits
         final buttonSize = widthBasedSize < heightBasedSize ? widthBasedSize : heightBasedSize;
         final spacing = (buttonSize * 0.12).clamp(4.0, 12.0);
 
@@ -552,6 +558,8 @@ class _NumericKeypad extends StatelessWidget {
   }) {
     final outletProvider = context.read<OutletProvider>();
     final staffProvider = context.read<StaffProvider>();
+    final orderProvider = context.read<OrderProvider>();
+    final catalogProvider = context.read<CatalogProvider>();
 
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
@@ -572,43 +580,28 @@ class _NumericKeypad extends StatelessWidget {
                 
                 // Auto-submit when 4 digits entered
                 if (loginProvider.pinLength == 4) {
-                  final currentOutletId = outletProvider.currentOutlet?.id ?? '';
-                  if (currentOutletId.isEmpty) {
-                    loginProvider.setError('No outlet selected');
+                  final currentOutletId = outletProvider.currentOutlet?.id;
+                  
+                  if (currentOutletId == null) {
+                    loginProvider.setError('Please select an outlet first');
                     return;
                   }
                   
-                  // Call loginWithPin
-                  final success = await loginProvider.loginWithPin(currentOutletId);
+                  // Authenticate staff with PIN for the selected outlet
+                  final success = await loginProvider.authenticateWithPin(currentOutletId);
                   
                   if (success && context.mounted) {
-                    // Set the authenticated staff in StaffProvider
                     final authenticatedStaff = loginProvider.authenticatedStaff;
                     if (authenticatedStaff != null) {
                       staffProvider.setCurrentStaff(authenticatedStaff);
-                      
-                      // Reset catalog navigation to root on login
-                      final catalogProvider = context.read<CatalogProvider>();
-                      debugPrint('🔄 Login: Resetting catalog navigation to top level');
                       catalogProvider.resetNavigation();
                       
-                      // Restore the staff's parked order (if exists)
-                      final orderProvider = context.read<OrderProvider>();
                       final restored = orderProvider.restoreOrderForStaff(authenticatedStaff.id);
-                      
                       if (!restored) {
-                        // No parked order, update the current order's staff ID
                         orderProvider.updateStaffId(authenticatedStaff.id);
                       }
                       
-                      // Find the StaffLoginScreen ancestor and call onLoginSuccess
-                      // This will use go_router's context.go('/') navigation
-                      final loginScreen = context.findAncestorWidgetOfExactType<StaffLoginScreen>();
-                      if (loginScreen != null) {
-                        loginScreen.onLoginSuccess();
-                      }
-                    } else {
-                      loginProvider.setError('Authentication error. Please try again.');
+                      onLoginSuccess();
                     }
                   }
                 }
@@ -642,7 +635,6 @@ class _KeypadButton extends StatelessWidget {
     final colorScheme = theme.colorScheme;
     final isSpecial = label == 'C' || label == '⌫';
     
-    // Scale font size with button size
     final fontSize = (size * 0.35).clamp(20.0, 32.0);
 
     return SizedBox(

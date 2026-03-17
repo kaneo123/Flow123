@@ -2,13 +2,31 @@ import 'package:flutter/foundation.dart';
 import 'package:flowtill/models/outlet_settings.dart';
 import 'package:flowtill/services/outlet_service.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
+import 'package:flowtill/database/app_database.dart';
+import 'package:flowtill/config/sync_config.dart';
 
 /// Service for outlet settings operations
 class OutletSettingsService {
-  /// Get settings for a specific outlet
+  final AppDatabase _db = AppDatabase.instance;
+
+  /// Get settings for a specific outlet (local-first when flag enabled)
   Future<ServiceResult<OutletSettings>> getSettingsForOutlet(String outletId) async {
     debugPrint('⚙️ OutletSettingsService: Fetching settings for outlet: $outletId');
 
+    // Step 3: LOCAL MIRROR FIRST (when feature flag is enabled)
+    if (kUseLocalMirrorReads && !kIsWeb) {
+      debugPrint('[LOCAL_MIRROR] OutletSettingsService: Trying local mirror first');
+      
+      final localResult = await _getSettingsFromLocalMirror(outletId);
+      if (localResult.isSuccess) {
+        debugPrint('[LOCAL_MIRROR] ✅ Using local data for outlet_settings (source=local)');
+        return localResult;
+      }
+      
+      debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for outlet_settings');
+    }
+
+    // Original Supabase logic
     final result = await SupabaseService.selectSingle(
       'outlet_settings',
       filters: {'outlet_id': outletId},
@@ -17,7 +35,7 @@ class OutletSettingsService {
     if (!result.isSuccess) {
       // If settings don't exist, create default settings
       if (result.error?.contains('No data found') == true || result.data == null) {
-        debugPrint('⚙️ OutletSettingsService: No settings found, creating defaults');
+        debugPrint('⚙️ OutletSettingsService: No settings found, creating defaults (source=supabase)');
         return await createDefaultSettings(outletId);
       }
       return ServiceResult.failure(result.error ?? 'Unknown error');
@@ -25,11 +43,39 @@ class OutletSettingsService {
 
     try {
       final settings = OutletSettings.fromJson(result.data!);
-      debugPrint('✅ OutletSettingsService: Settings loaded successfully');
+      debugPrint('✅ OutletSettingsService: Settings loaded successfully (source=supabase)');
       return ServiceResult.success(settings);
     } catch (e) {
       debugPrint('❌ OutletSettingsService: Failed to parse settings: $e');
       return ServiceResult.failure('Failed to parse settings: ${e.toString()}');
+    }
+  }
+
+  /// Get settings from local mirror table
+  Future<ServiceResult<OutletSettings>> _getSettingsFromLocalMirror(String outletId) async {
+    debugPrint('  📂 Reading from local mirror table: outlet_settings');
+
+    try {
+      final db = await _db.database;
+      final results = await db.query(
+        'outlet_settings',
+        where: 'outlet_id = ?',
+        whereArgs: [outletId],
+        limit: 1,
+      );
+
+      if (results.isEmpty) {
+        debugPrint('  ⚠️ Local mirror table empty for outlet_id: $outletId');
+        return ServiceResult.failure('Local mirror table empty');
+      }
+
+      final json = results.first;
+      final settings = OutletSettings.fromJson(json);
+      debugPrint('  ✅ Local mirror has outlet_settings');
+      return ServiceResult.success(settings);
+    } catch (e) {
+      debugPrint('  ❌ Failed to read from local mirror: $e');
+      return ServiceResult.failure('Failed to read local mirror: ${e.toString()}');
     }
   }
 

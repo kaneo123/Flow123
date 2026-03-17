@@ -9,6 +9,7 @@ import 'package:flowtill/theme.dart';
 import 'package:flowtill/services/local_storage_service.dart';
 import 'package:flowtill/services/connection_service.dart';
 import 'package:flowtill/services/sync_service.dart';
+import 'package:flowtill/services/schema_sync_service.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
 import 'package:flowtill/providers/outlet_provider.dart';
 import 'package:flowtill/providers/catalog_provider.dart';
@@ -61,10 +62,14 @@ void main() async {
   await LocalStorageService().init();
   await SupabaseConfig.initialize();
   
-  // Initialize offline mode services (lazy loading - sync happens when outlet is selected)
+  // Initialize schema sync service (mirrors Supabase table structure to local SQLite)
+  await SchemaSyncService().initialize();
+  debugPrint('[STARTUP] Schema sync complete');
+  
+  // Initialize offline mode services
   await ConnectionService().initialize();
   await SyncService().initialize();
-  debugPrint('🔄 Offline mode initialized (lazy sync enabled)');
+  debugPrint('[STARTUP] Services initialized');
   
   runApp(const MyApp());
 }

@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 class TaxRate {
   final String id;
   final String name;
@@ -18,10 +20,12 @@ class TaxRate {
   factory TaxRate.fromJson(Map<String, dynamic> json) => TaxRate(
     id: json['id'] as String,
     name: json['name'] as String,
-    rate: (json['rate'] as num).toDouble(),
-    isDefault: json['is_default'] as bool? ?? false,
-    createdAt: DateTime.parse(json['created_at'] as String),
-    updatedAt: DateTime.parse(json['updated_at'] as String),
+    rate: SQLiteConverters.toDouble(json['rate']) ?? 0.0,
+    isDefault: SQLiteConverters.toBool(json['is_default']) ?? false,
+    createdAt: SQLiteConverters.toDateTime(json['created_at']) ?? DateTime.now(),
+    updatedAt: SQLiteConverters.toDateTime(json['updated_at']) ?? 
+               SQLiteConverters.toDateTime(json['created_at']) ?? 
+               DateTime.now(), // Fallback to created_at if updated_at is missing
   );
 
   Map<String, dynamic> toJson() => {

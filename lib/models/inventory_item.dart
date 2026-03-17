@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 class InventoryItem {
   final String id;
   final String outletId;
@@ -71,40 +73,19 @@ class InventoryItem {
   };
 
   factory InventoryItem.fromJson(Map<String, dynamic> json) {
-    // Helper to parse numeric fields that may come as strings from Supabase
-    double parseNumeric(dynamic value, {double defaultValue = 0.0}) {
-      if (value == null) return defaultValue;
-      if (value is num) return value.toDouble();
-      if (value is String) {
-        final parsed = double.tryParse(value);
-        return parsed ?? defaultValue;
-      }
-      return defaultValue;
-    }
-    
-    // Safe string parsing
-    String safeString(dynamic value, String defaultValue) {
-      if (value == null) return defaultValue;
-      return value.toString();
-    }
-    
     return InventoryItem(
-      id: safeString(json['id'], ''),
-      outletId: safeString(json['outlet_id'], ''),
-      name: safeString(json['name'], 'Unknown Item'),
+      id: json['id']?.toString() ?? '',
+      outletId: json['outlet_id']?.toString() ?? '',
+      name: json['name']?.toString() ?? 'Unknown Item',
       sku: json['sku']?.toString(),
       category: json['category']?.toString(),
       location: json['location']?.toString(),
-      currentQty: parseNumeric(json['current_qty']),
-      unit: safeString(json['unit'], 'unit'),
-      parLevel: json['par_level'] != null ? parseNumeric(json['par_level']) : null,
+      currentQty: SQLiteConverters.toDouble(json['current_qty']) ?? 0.0,
+      unit: json['unit']?.toString() ?? 'unit',
+      parLevel: SQLiteConverters.toDouble(json['par_level']),
       linkedProductId: json['linked_product_id']?.toString(),
-      createdAt: json['created_at'] != null 
-          ? DateTime.parse(json['created_at'] as String) 
-          : DateTime.now(),
-      updatedAt: json['updated_at'] != null 
-          ? DateTime.parse(json['updated_at'] as String) 
-          : null,
+      createdAt: SQLiteConverters.toDateTime(json['created_at']) ?? DateTime.now(),
+      updatedAt: SQLiteConverters.toDateTime(json['updated_at']),
     );
   }
 }

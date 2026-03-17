@@ -3,11 +3,16 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:flowtill/services/version_service.dart';
+import 'package:flowtill/services/local_storage_service.dart';
+import 'package:flowtill/services/startup_content_sync_orchestrator.dart';
+import 'package:flowtill/services/outlet_service.dart';
 import 'package:flowtill/models/app_version.dart';
+import 'package:flowtill/models/startup_sync_progress.dart';
 import 'package:flowtill/main.dart' show splashShown;
 import 'package:dio/dio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:open_filex/open_filex.dart';
+import 'dart:async';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -18,10 +23,17 @@ class SplashScreen extends StatefulWidget {
 
 class _SplashScreenState extends State<SplashScreen> {
   final _versionService = VersionService();
+  final _startupSyncOrchestrator = StartupContentSyncOrchestrator();
+  StreamSubscription<StartupSyncProgress>? _syncProgressSubscription;
+  
   String _statusMessage = 'Checking for updates...';
   bool _showRetry = false;
   bool _isDownloading = false;
   double _downloadProgress = 0.0;
+  
+  // Startup content sync state
+  bool _isContentSyncing = false;
+  StartupSyncProgress? _syncProgress;
   
   static const String _apkDownloadUrl = 'https://rvfrqptzupzupkiojbcy.supabase.co/storage/v1/object/public/app_releases/app-debug.apk';
 
@@ -30,6 +42,12 @@ class _SplashScreenState extends State<SplashScreen> {
     super.initState();
     debugPrint('🚀 SplashScreen: initState called');
     _performVersionCheck();
+  }
+
+  @override
+  void dispose() {
+    _syncProgressSubscription?.cancel();
+    super.dispose();
   }
 
   Future<void> _performVersionCheck() async {
@@ -242,11 +260,149 @@ class _SplashScreenState extends State<SplashScreen> {
     }
   }
 
-  void _proceedToLogin() {
+  void _proceedToLogin() async {
     if (!mounted) return;
     
-    debugPrint('➡️ SplashScreen: Proceeding to login screen');
-    setState(() => _statusMessage = 'Loading...');
+    debugPrint('');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    debugPrint('[STARTUP_SYNC] DETERMINING STARTUP OUTLET');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    
+    // WEB GUARD: Skip mirror sync on web platform (SQLite not available)
+    if (kIsWeb) {
+      debugPrint('[STARTUP_SYNC] 🌐 WEB PLATFORM DETECTED');
+      debugPrint('[STARTUP_SYNC] Skipping mirror content sync (web uses direct Supabase access)');
+      debugPrint('[STARTUP_SYNC] Proceeding directly to login');
+      _navigateToLogin();
+      return;
+    }
+    
+    // STEP 1: Check for saved outlet ID
+    String? startupOutletId = LocalStorageService().getLastSelectedOutletId();
+    
+    if (startupOutletId != null) {
+      debugPrint('[STARTUP_SYNC] ✅ Last outlet found: $startupOutletId');
+    } else {
+      debugPrint('[STARTUP_SYNC] No saved outlet, need to resolve startup outlet');
+      
+      // STEP 2: Ensure outlets are available (fetch and cache if needed)
+      setState(() {
+        _statusMessage = 'Loading outlets...';
+      });
+      
+      startupOutletId = await _ensureOutletsAndGetStartupOutlet();
+      
+      if (startupOutletId == null) {
+        debugPrint('[STARTUP_SYNC] ❌ No outlets available, cannot proceed with content sync');
+        debugPrint('[STARTUP_SYNC] Proceeding to login without content sync');
+        _navigateToLogin();
+        return;
+      }
+      
+      debugPrint('[STARTUP_SYNC] ✅ Startup outlet resolved: $startupOutletId');
+      
+      // STEP 3: Save this outlet for future launches
+      await LocalStorageService().saveLastSelectedOutletId(startupOutletId);
+      debugPrint('[STARTUP_SYNC] Saved startup outlet for future launches');
+    }
+    
+    // STEP 4: Run automatic content sync
+    debugPrint('[STARTUP_SYNC] Starting automatic content mirror sync');
+    await _performStartupContentSync(startupOutletId);
+  }
+  
+  /// Ensure outlets are available and return a startup outlet ID
+  /// Fetches from Supabase if local mirror is empty
+  Future<String?> _ensureOutletsAndGetStartupOutlet() async {
+    debugPrint('[STARTUP_SYNC] Ensuring outlets are available...');
+    
+    try {
+      // Import needed for OutletService
+      final outletService = OutletService();
+      
+      // Try to get outlets (will check local mirror first if flag enabled)
+      final result = await outletService.getAllOutlets();
+      
+      if (!result.isSuccess || result.data == null || result.data!.isEmpty) {
+        debugPrint('[STARTUP_SYNC] ❌ Failed to fetch outlets: ${result.error}');
+        return null;
+      }
+      
+      final outlets = result.data!;
+      debugPrint('[STARTUP_SYNC] ✅ ${outlets.length} outlets available');
+      
+      // Return first outlet ID
+      final firstOutlet = outlets.first;
+      debugPrint('[STARTUP_SYNC] Selected startup outlet: ${firstOutlet.name} (${firstOutlet.id})');
+      return firstOutlet.id;
+      
+    } catch (e, stackTrace) {
+      debugPrint('[STARTUP_SYNC] ❌ Error ensuring outlets: $e');
+      debugPrint('Stack: $stackTrace');
+      return null;
+    }
+  }
+
+  Future<void> _performStartupContentSync(String outletId) async {
+    if (!mounted) return;
+    
+    setState(() {
+      _isContentSyncing = true;
+      _statusMessage = 'Preparing content sync...';
+      _syncProgress = StartupSyncProgress.initial();
+    });
+
+    // Listen to sync progress
+    _syncProgressSubscription = _startupSyncOrchestrator.progressStream.listen((progress) {
+      if (!mounted) return;
+      setState(() {
+        _syncProgress = progress;
+        _statusMessage = progress.currentStepLabel;
+      });
+    });
+
+    try {
+      // Run startup content sync
+      final success = await _startupSyncOrchestrator.runStartupSync(outletId);
+      
+      if (!mounted) return;
+      
+      if (success) {
+        debugPrint('✅ SplashScreen: Startup content sync completed successfully');
+        _navigateToLogin();
+      } else {
+        debugPrint('⚠️ SplashScreen: Startup content sync failed, but proceeding to login');
+        // Show error briefly but still proceed
+        setState(() {
+          _statusMessage = 'Sync incomplete, continuing...';
+          _showRetry = false;
+        });
+        await Future.delayed(const Duration(seconds: 1));
+        _navigateToLogin();
+      }
+    } catch (e) {
+      debugPrint('❌ SplashScreen: Error during startup content sync: $e');
+      if (!mounted) return;
+      
+      // Show error with retry option
+      setState(() {
+        _statusMessage = 'Content sync failed';
+        _showRetry = true;
+        _isContentSyncing = false;
+      });
+    } finally {
+      _syncProgressSubscription?.cancel();
+    }
+  }
+
+  void _navigateToLogin() {
+    if (!mounted) return;
+    
+    debugPrint('➡️ SplashScreen: Navigating to login screen');
+    setState(() {
+      _statusMessage = 'Loading...';
+      _isContentSyncing = false;
+    });
     
     // Mark splash as shown for this session
     splashShown = true;
@@ -303,11 +459,38 @@ class _SplashScreenState extends State<SplashScreen> {
               
               // Loading Indicator
               if (!_showRetry) ...[
-                const CircularProgressIndicator(color: Color(0xFF40E0D0)),
+                // Show progress bar if content syncing
+                if (_isContentSyncing && _syncProgress != null) ...[
+                  Container(
+                    width: 300,
+                    child: Column(
+                      children: [
+                        LinearProgressIndicator(
+                          value: _syncProgress!.percentComplete / 100,
+                          backgroundColor: Colors.grey[300],
+                          color: const Color(0xFF40E0D0),
+                          minHeight: 6,
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          '${_syncProgress!.percentComplete}%',
+                          style: TextStyle(
+                            color: Colors.grey[600],
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ] else ...[
+                  const CircularProgressIndicator(color: Color(0xFF40E0D0)),
+                ],
                 const SizedBox(height: 16),
                 Text(
                   _statusMessage,
                   style: TextStyle(color: Colors.grey[600], fontSize: 14),
+                  textAlign: TextAlign.center,
                 ),
               ] else ...[
                 Icon(Icons.cloud_off, color: Colors.grey[400], size: 48),

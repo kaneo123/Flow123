@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 /// Represents an active session where a staff member has a table/tab open
 class TableSession {
   final String id;
@@ -79,11 +81,11 @@ class TableSession {
     staffId: json['staff_id'] as String?,
     staffName: json['staff_name'] as String,
     deviceId: json['device_id'] as String?,
-    sessionStartedAt: DateTime.parse(json['session_started_at'] as String),
-    lastHeartbeatAt: DateTime.parse(json['last_heartbeat_at'] as String),
-    isActive: json['is_active'] as bool? ?? true,
-    createdAt: DateTime.parse(json['created_at'] as String),
-    updatedAt: DateTime.parse(json['updated_at'] as String),
+    sessionStartedAt: SQLiteConverters.toDateTime(json['session_started_at']) ?? DateTime.now(),
+    lastHeartbeatAt: SQLiteConverters.toDateTime(json['last_heartbeat_at']) ?? DateTime.now(),
+    isActive: SQLiteConverters.toBool(json['is_active']) ?? true,
+    createdAt: SQLiteConverters.toDateTime(json['created_at']) ?? DateTime.now(),
+    updatedAt: SQLiteConverters.toDateTime(json['updated_at']) ?? DateTime.now(),
   );
 
   /// Check if this session is stale (no heartbeat in last 5 minutes)

@@ -1,9 +1,11 @@
 import 'package:flutter/foundation.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:flowtill/models/category.dart' as models;
 import 'package:flowtill/database/app_database.dart';
 import 'package:flowtill/services/outlet_service.dart';
 import 'package:flowtill/services/connection_service.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
+import 'package:flowtill/config/sync_config.dart';
 
 class CategoryService {
   final AppDatabase _db = AppDatabase.instance;
@@ -37,9 +39,22 @@ class CategoryService {
   }
 
   Future<ServiceResult<List<models.Category>>> getCategoriesForOutlet(String outletId) async {
-    // Online-first (with special handling for web)
+    // Step 3: LOCAL MIRROR FIRST (when feature flag is enabled)
+    if (kUseLocalMirrorReads && !kIsWeb) {
+      debugPrint('[LOCAL_MIRROR] CategoryService: Trying local mirror first for outlet: $outletId');
+      
+      final localResult = await _getCategoriesFromLocalMirror(outletId);
+      if (localResult.isSuccess && localResult.data != null && localResult.data!.isNotEmpty) {
+        debugPrint('[LOCAL_MIRROR] ✅ Using local data for categories (${localResult.data!.length} records, source=local)');
+        return localResult;
+      }
+      
+      debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for categories');
+    }
+
+    // Original online-first logic (with special handling for web)
     if (kIsWeb || _connectionService.isOnline) {
-      debugPrint('📂 CategoryService: Fetching categories for outlet: $outletId (from Supabase - ${kIsWeb ? "Web" : "ONLINE"})');
+      debugPrint('📂 CategoryService: Fetching categories for outlet: $outletId (from Supabase - ${kIsWeb ? "Web" : "ONLINE"}, source=supabase)');
       try {
         final response = await SupabaseConfig.client
             .from('categories')
@@ -52,17 +67,39 @@ class CategoryService {
         // Cache to local DB for offline access (on mobile/desktop only)
         if (!kIsWeb) {
           try {
-            final categoryMaps = categories.map((c) => {
-              'id': c.id,
-              'name': c.name,
-              'sort_order': c.sortOrder,
-              'color': null,
-              'updated_at': DateTime.now().millisecondsSinceEpoch,
+            // Get local table columns to ensure we only write what exists
+            final db = await _db.database;
+            final localColumns = await _getLocalTableColumns(db, 'categories');
+            debugPrint('📋 Local categories table has ${localColumns.length} columns: ${localColumns.join(", ")}');
+            
+            final categoryMaps = categories.map((c) {
+              final data = <String, dynamic>{
+                'id': c.id,
+                'outlet_id': c.outletId,
+                'name': c.name,
+                'description': c.description,
+                'sort_order': c.sortOrder,
+                'active': c.active ? 1 : 0,
+                'created_at': (c.createdAt ?? DateTime.now()).millisecondsSinceEpoch,
+                'parent_id': c.parentId,
+              };
+              
+              // Filter to only include columns that exist in local table
+              final filteredData = <String, dynamic>{};
+              for (final entry in data.entries) {
+                if (localColumns.contains(entry.key)) {
+                  filteredData[entry.key] = entry.value;
+                }
+              }
+              
+              return filteredData;
             }).toList();
+            
             await _db.insertCategories(categoryMaps);
             debugPrint('💾 CategoryService: Cached ${categories.length} categories to local DB for offline access');
-          } catch (e) {
+          } catch (e, stackTrace) {
             debugPrint('⚠️ CategoryService: Failed to cache categories (non-fatal): $e');
+            debugPrint('Stack: $stackTrace');
           }
         }
         
@@ -85,6 +122,48 @@ class CategoryService {
     } catch (e) {
       debugPrint('❌ CategoryService error: $e');
       return ServiceResult.failure('Failed to fetch categories: ${e.toString()}');
+    }
+  }
+
+  /// Get categories from local mirror table
+  Future<ServiceResult<List<models.Category>>> _getCategoriesFromLocalMirror(String outletId) async {
+    debugPrint('  📂 Reading from local mirror table: categories');
+
+    try {
+      final db = await _db.database;
+      final results = await db.query(
+        'categories',
+        where: 'outlet_id = ?',
+        whereArgs: [outletId],
+        orderBy: 'sort_order',
+      );
+
+      if (results.isEmpty) {
+        debugPrint('  ⚠️ Local mirror table empty: categories');
+        return ServiceResult.failure('Local mirror table empty');
+      }
+
+      final categories = <models.Category>[];
+      for (final json in results) {
+        try {
+          debugPrint('  📦 Parsing category from local mirror: ${json['name']}');
+          debugPrint('     Available columns: ${json.keys.join(", ")}');
+          
+          final category = models.Category.fromJson(json);
+          categories.add(category);
+        } catch (e, stackTrace) {
+          debugPrint('  ❌ Failed to parse category from local mirror: $e');
+          debugPrint('     Row data: $json');
+          debugPrint('     Stack: $stackTrace');
+          // Continue parsing other categories
+        }
+      }
+
+      debugPrint('  ✅ Local mirror has ${categories.length} categories');
+      return ServiceResult.success(categories);
+    } catch (e) {
+      debugPrint('  ❌ Failed to read from local mirror: $e');
+      return ServiceResult.failure('Failed to read local mirror: ${e.toString()}');
     }
   }
   
@@ -144,5 +223,21 @@ class CategoryService {
 
   Future<ServiceResult<void>> deleteCategory(String id) async {
     return ServiceResult.failure('Category deletion is not supported in Till mode. Use BackOffice.');
+  }
+  
+  /// Get list of column names for a local table
+  Future<Set<String>> _getLocalTableColumns(Database db, String tableName) async {
+    try {
+      final result = await db.rawQuery('PRAGMA table_info($tableName)');
+      final columns = <String>{};
+      for (final row in result) {
+        final columnName = row['name'] as String;
+        columns.add(columnName);
+      }
+      return columns;
+    } catch (e) {
+      debugPrint('⚠️ Failed to get columns for $tableName: $e');
+      return {};
+    }
   }
 }

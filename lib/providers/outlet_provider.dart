@@ -4,6 +4,8 @@ import 'package:flowtill/models/outlet_settings.dart';
 import 'package:flowtill/services/outlet_service.dart';
 import 'package:flowtill/services/outlet_settings_service.dart';
 import 'package:flowtill/services/sync_service.dart';
+import 'package:flowtill/services/local_storage_service.dart';
+import 'package:flowtill/config/sync_config.dart';
 
 /// Provider for outlet state management with comprehensive error handling
 class OutletProvider with ChangeNotifier {
@@ -80,12 +82,21 @@ class OutletProvider with ChangeNotifier {
       debugPrint('   Service Charge Enabled: ${outlet.enableServiceCharge}');
       debugPrint('   Service Charge Percent: ${outlet.serviceChargePercent}%');
       
+      // Save last selected outlet for startup content sync
+      await LocalStorageService().saveLastSelectedOutletId(outlet.id);
+      
       // Load settings for this outlet
       await loadSettingsForCurrentOutlet();
       
-      // Trigger sync for this outlet (lazy loading: critical data first, then background sync)
-      debugPrint('🔄 OutletProvider: Triggering sync for outlet ${outlet.id}');
-      SyncService().syncCriticalData(outlet.id);
+      // Trigger sync for this outlet (only if auto-sync is enabled)
+      if (kAutoContentSyncOnStartup) {
+        debugPrint('🔄 OutletProvider: Triggering sync for outlet ${outlet.id}');
+        SyncService().syncCriticalData(outlet.id);
+      } else {
+        debugPrint('🔄 OutletProvider: Auto content sync is DISABLED for outlet ${outlet.id}');
+        debugPrint('   Outlet selected but no data downloaded');
+        debugPrint('   Trigger manual sync from Dev Settings to download data');
+      }
       
       notifyListeners();
     }

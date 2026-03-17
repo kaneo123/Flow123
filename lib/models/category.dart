@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 class Category {
   final String id;
   final String outletId;
@@ -25,9 +27,9 @@ class Category {
       outletId: json['outlet_id'] as String? ?? '',
       name: json['name'] as String? ?? '',
       description: json['description'] as String?,
-      sortOrder: json['sort_order'] as int? ?? 0,
-      active: json['active'] as bool? ?? true,
-      createdAt: json['created_at'] != null ? DateTime.tryParse(json['created_at'] as String) : null,
+      sortOrder: SQLiteConverters.toInt(json['sort_order']) ?? 0,
+      active: SQLiteConverters.toBool(json['active']) ?? true,
+      createdAt: SQLiteConverters.toDateTime(json['created_at']),
       parentId: json['parent_id'] as String?,
     );
   }

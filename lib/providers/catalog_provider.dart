@@ -74,7 +74,7 @@ class CatalogProvider with ChangeNotifier {
 
   /// Load complete catalog (categories + products with inventory) for an outlet
   Future<void> loadCatalog(String outletId) async {
-    debugPrint('📋 CatalogProvider: Loading catalog for outlet: $outletId');
+    debugPrint('[CATALOG_PROVIDER] Loading catalog for outlet: $outletId');
     
     _currentOutletId = outletId;
     _isLoading = true;
@@ -87,7 +87,7 @@ class CatalogProvider with ChangeNotifier {
       late final ServiceResult<List<Product>> productsResult;
       late final ServiceResult<List<TaxRate>> taxRatesResult;
 
-      debugPrint('🔄 CatalogProvider: Starting to load catalog for outlet $outletId...');
+      debugPrint('[CATALOG_PROVIDER] Starting parallel data fetch for outlet $outletId...');
       
       await Future.wait([
         _categoryService.getCategoriesForOutlet(outletId).then((r) => categoriesResult = r),
@@ -95,46 +95,66 @@ class CatalogProvider with ChangeNotifier {
         _taxRateService.getAllTaxRates().then((r) => taxRatesResult = r),
         _promotionService.loadActivePromotions(outletId),
         _packagedDealService.loadActiveDeals(outletId).catchError((e, stackTrace) {
-          debugPrint('❌ CatalogProvider: PackagedDealService.loadActiveDeals() threw error: $e');
+          debugPrint('[CATALOG_PROVIDER] ❌ PackagedDealService.loadActiveDeals() threw error: $e');
           debugPrint('Stack: $stackTrace');
         }),
       ]);
 
-      debugPrint('📦 CatalogProvider: Packaged deals loading attempt complete');
+      debugPrint('[CATALOG_PROVIDER] ✅ Parallel fetch complete');
+      
+      // Debug packaged deals
       final allDeals = _packagedDealService.getAllActiveDeals();
-      debugPrint('   Total active deals for this outlet: ${allDeals.length}');
+      debugPrint('[CATALOG_PROVIDER] Packaged deals: ${allDeals.length} total for this outlet');
       if (allDeals.isEmpty) {
-        debugPrint('   ⚠️  NO DEALS FOUND for outlet $outletId');
-        debugPrint('   💡 Check if deals exist in the database for this outlet');
-      } else {
-        for (final deal in allDeals) {
-          debugPrint('   ✅ Deal found: ${deal.name} @ £${deal.price.toStringAsFixed(2)}');
-        }
+        debugPrint('[CATALOG_PROVIDER] ⚠️ No deals found for outlet $outletId');
       }
       final availableNow = _packagedDealService.getAvailableDealsForNow();
-      debugPrint('   Available now: ${availableNow.length}');
+      debugPrint('[CATALOG_PROVIDER] Available deals now: ${availableNow.length}');
 
       // Handle categories
+      debugPrint('[CATALOG_PROVIDER] Processing categories result...');
       if (!categoriesResult.isSuccess) {
         _errorMessage = categoriesResult.error ?? 'Failed to load categories';
-        debugPrint('❌ CatalogProvider: ${_errorMessage}');
+        debugPrint('[CATALOG_PROVIDER] ❌ ${_errorMessage}');
         _isLoading = false;
         notifyListeners();
         return;
       }
 
       // Handle products
+      debugPrint('[CATALOG_PROVIDER] Processing products result...');
       if (!productsResult.isSuccess) {
         _errorMessage = productsResult.error ?? 'Failed to load products';
-        debugPrint('❌ CatalogProvider: ${_errorMessage}');
+        debugPrint('[CATALOG_PROVIDER] ❌ ${_errorMessage}');
         _isLoading = false;
         notifyListeners();
         return;
       }
 
+      // Handle tax rates
+      debugPrint('[CATALOG_PROVIDER] Processing tax rates result...');
+      debugPrint('[CATALOG_PROVIDER]   taxRatesResult.isSuccess: ${taxRatesResult.isSuccess}');
+      debugPrint('[CATALOG_PROVIDER]   taxRatesResult.data: ${taxRatesResult.data}');
+      debugPrint('[CATALOG_PROVIDER]   taxRatesResult.error: ${taxRatesResult.error}');
+      
+      if (!taxRatesResult.isSuccess) {
+        debugPrint('[CATALOG_PROVIDER] ⚠️ Tax rates fetch failed: ${taxRatesResult.error}');
+        debugPrint('[CATALOG_PROVIDER] Continuing with empty tax rates list');
+      }
+
       _categories = categoriesResult.data ?? [];
       _products = productsResult.data ?? [];
       _taxRates = taxRatesResult.data ?? [];
+      
+      debugPrint('[CATALOG_PROVIDER] ✅ Data assigned:');
+      debugPrint('[CATALOG_PROVIDER]   Categories: ${_categories.length}');
+      debugPrint('[CATALOG_PROVIDER]   Products: ${_products.length}');
+      debugPrint('[CATALOG_PROVIDER]   Tax Rates: ${_taxRates.length}');
+      if (_taxRates.isNotEmpty) {
+        for (final rate in _taxRates) {
+          debugPrint('[CATALOG_PROVIDER]     - ${rate.name}: ${rate.rate}%');
+        }
+      }
 
       // 🔍 Enhanced debugging - Check parsed products
       debugPrint('🔍 CatalogProvider: Loaded ${_products.length} products');
@@ -162,15 +182,8 @@ class CatalogProvider with ChangeNotifier {
         Future.microtask(() => _buildProductsByCategory()),
       ]);
       
-      // 🧾 Debug: Check if Roast Beef stock was loaded
-      final roastBeefStock = _stockService.getStockInfoForProduct('b8ca25d0-3bc8-4d5b-9122-c69090fd4195');
-      debugPrint('🧾 CatalogProvider: Roast Beef stock after loading: ${roastBeefStock != null ? 'EXISTS' : 'NULL'}');
-      if (roastBeefStock != null) {
-        debugPrint('🧾   trackStock: ${roastBeefStock.trackStock}');
-        debugPrint('🧾   isEnhancedMode: ${roastBeefStock.isEnhancedMode}');
-        debugPrint('🧾   portionsRemaining: ${roastBeefStock.portionsRemaining}');
-        debugPrint('🧾   displayQuantity: ${roastBeefStock.displayQuantity}');
-      }
+      // 🧾 Stock Diagnostics: Check products configured to track stock
+      await _runStockDiagnostics(outletId);
 
       // Auto-select first top-level category
       if (_categories.isNotEmpty && _selectedCategoryId == null) {
@@ -180,11 +193,16 @@ class CatalogProvider with ChangeNotifier {
         }
       }
 
-      debugPrint('✅ CatalogProvider: Catalog loaded successfully');
-      debugPrint('   Categories: ${_categories.length}');
-      debugPrint('   Products: ${_products.length}');
-      debugPrint('   Tax Rates: ${_taxRates.length}');
-      debugPrint('   Products with active promotions: ${_productIdsWithActivePromotions.length}');
+      debugPrint('');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('[CATALOG_PROVIDER] ✅ CATALOG LOADED SUCCESSFULLY');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('[CATALOG_PROVIDER] Categories: ${_categories.length}');
+      debugPrint('[CATALOG_PROVIDER] Products: ${_products.length}');
+      debugPrint('[CATALOG_PROVIDER] Tax Rates: ${_taxRates.length}');
+      debugPrint('[CATALOG_PROVIDER] Products with active promotions: ${_productIdsWithActivePromotions.length}');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('');
 
       _isLoading = false;
       _errorMessage = null;
@@ -195,7 +213,7 @@ class CatalogProvider with ChangeNotifier {
       notifyListeners();
     } catch (e) {
       _errorMessage = 'Unexpected error loading catalog: ${e.toString()}';
-      debugPrint('❌ CatalogProvider: ${_errorMessage}');
+      debugPrint('[CATALOG_PROVIDER] ❌ Error: ${_errorMessage}');
       _isLoading = false;
       notifyListeners();
     }
@@ -204,11 +222,11 @@ class CatalogProvider with ChangeNotifier {
   /// Refresh stock levels only (optimized for speed)
   Future<void> refreshStockOnly() async {
     if (_currentOutletId == null || _products.isEmpty) {
-      debugPrint('⚠️ CatalogProvider: Cannot refresh stock - no catalog loaded');
+      debugPrint('[CATALOG_PROVIDER] ⚠️ Cannot refresh stock - no catalog loaded');
       return;
     }
 
-    debugPrint('🔄 CatalogProvider: Refreshing stock levels only...');
+    debugPrint('[CATALOG_PROVIDER] 🔄 Refreshing stock levels only...');
     _isRefreshingStock = true;
     notifyListeners();
 
@@ -216,9 +234,9 @@ class CatalogProvider with ChangeNotifier {
       // Only reload stock data (fastest operation)
       await _stockService.loadStockForOutlet(_currentOutletId!, _products);
       
-      debugPrint('✅ CatalogProvider: Stock levels refreshed successfully');
+      debugPrint('[CATALOG_PROVIDER] ✅ Stock levels refreshed successfully');
     } catch (e) {
-      debugPrint('❌ CatalogProvider: Error refreshing stock - $e');
+      debugPrint('[CATALOG_PROVIDER] ❌ Error refreshing stock: $e');
     } finally {
       _isRefreshingStock = false;
       notifyListeners();
@@ -607,7 +625,7 @@ class CatalogProvider with ChangeNotifier {
     _productIdsWithActivePromotions.clear();
     
     final activePromotions = _promotionService.getActivePromotionsForNow();
-    debugPrint('🌟 CatalogProvider: Processing ${activePromotions.length} active promotions');
+    debugPrint('[CATALOG_PROVIDER] Processing ${activePromotions.length} active promotions');
     
     for (final product in _products) {
       final hasPromotion = _promotionService.getPromotionsForProduct(product.id, product.categoryId).isNotEmpty;
@@ -616,7 +634,7 @@ class CatalogProvider with ChangeNotifier {
       }
     }
     
-    debugPrint('🌟 CatalogProvider: Found ${_productIdsWithActivePromotions.length} products with active promotions');
+    debugPrint('[CATALOG_PROVIDER] Found ${_productIdsWithActivePromotions.length} products with active promotions');
   }
 
   /// Check if a product has any active promotion
@@ -671,6 +689,65 @@ class CatalogProvider with ChangeNotifier {
     notifyListeners();
   }
 
+  /// Run stock diagnostics to identify why stock info might be missing
+  Future<void> _runStockDiagnostics(String outletId) async {
+    debugPrint('');
+    debugPrint('─────────────────────────────────────────────────────────');
+    debugPrint('[STOCK_DIAGNOSTICS] Checking stock configuration');
+    debugPrint('─────────────────────────────────────────────────────────');
+    
+    // Find all products that claim to track stock
+    final stockTrackedProducts = _products.where((p) => p.trackStock).toList();
+    
+    if (stockTrackedProducts.isEmpty) {
+      debugPrint('[STOCK_DIAGNOSTICS] No products configured to track stock');
+      debugPrint('─────────────────────────────────────────────────────────');
+      debugPrint('');
+      return;
+    }
+    
+    debugPrint('[STOCK_DIAGNOSTICS] Found ${stockTrackedProducts.length} products configured to track stock');
+    
+    int withStockInfo = 0;
+    int withoutStockInfo = 0;
+    int withLinkedInventory = 0;
+    int withoutLinkedInventory = 0;
+    
+    for (final product in stockTrackedProducts) {
+      final stockInfo = _stockService.getStockInfoForProduct(product.id);
+      
+      if (stockInfo != null) {
+        withStockInfo++;
+      } else {
+        withoutStockInfo++;
+        
+        // Diagnose why stock info is missing
+        if (product.linkedInventoryItemId != null) {
+          withLinkedInventory++;
+          debugPrint('[STOCK_DIAGNOSTICS] ⚠️ "${product.name}":');
+          debugPrint('  - Has linkedInventoryItemId: ${product.linkedInventoryItemId}');
+          debugPrint('  - But stock info is NULL');
+          debugPrint('  - Possible cause: Linked inventory item does not exist or has no quantity');
+        } else {
+          withoutLinkedInventory++;
+          debugPrint('[STOCK_DIAGNOSTICS] ⚠️ "${product.name}":');
+          debugPrint('  - trackStock=true but linkedInventoryItemId=null');
+          debugPrint('  - Should use recipe-based tracking (enhanced mode)');
+          debugPrint('  - Possible cause: No active recipe defined for this product');
+        }
+      }
+    }
+    
+    debugPrint('');
+    debugPrint('[STOCK_DIAGNOSTICS] Summary:');
+    debugPrint('  Products with stock info loaded: $withStockInfo');
+    debugPrint('  Products missing stock info: $withoutStockInfo');
+    debugPrint('    - With linkedInventoryItemId: $withLinkedInventory (inventory item may not exist)');
+    debugPrint('    - Without linkedInventoryItemId: $withoutLinkedInventory (need recipe-based tracking)');
+    debugPrint('─────────────────────────────────────────────────────────');
+    debugPrint('');
+  }
+
   @override
   void dispose() {
     stopPeriodicRefresh();
@@ -690,3 +767,4 @@ class BreadcrumbItem {
     required this.index,
   });
 }
+

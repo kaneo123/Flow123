@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:flowtill/utils/sqlite_converters.dart';
 
 class OutletSettings {
   final String outletId;
@@ -41,89 +42,28 @@ class OutletSettings {
   factory OutletSettings.fromJson(Map<String, dynamic> json) {
     try {
       final outletId = json['outlet_id']?.toString() ?? '';
-      final printOrderTicketsOnOrderAway = json['print_order_tickets_on_order_away'] == true;
+      final printOrderTicketsOnOrderAway = SQLiteConverters.toBool(json['print_order_tickets_on_order_away']) ?? false;
       
       // Clamp orderTicketCopies between 1 and 5
-      int orderTicketCopies = 1;
-      if (json['order_ticket_copies'] != null) {
-        final raw = json['order_ticket_copies'];
-        if (raw is int) {
-          orderTicketCopies = raw.clamp(1, 5);
-        } else if (raw is String) {
-          orderTicketCopies = (int.tryParse(raw) ?? 1).clamp(1, 5);
-        }
-      }
+      final orderTicketCopies = (SQLiteConverters.toInt(json['order_ticket_copies']) ?? 1).clamp(1, 5);
 
-      DateTime createdAt = DateTime.now();
-      if (json['created_at'] != null) {
-        try {
-          createdAt = DateTime.parse(json['created_at'].toString());
-        } catch (e) {
-          debugPrint('⚠️ OutletSettings.fromJson: Invalid created_at timestamp: ${json['created_at']}');
-        }
-      }
+      final createdAt = SQLiteConverters.toDateTime(json['created_at']) ?? DateTime.now();
+      final updatedAt = SQLiteConverters.toDateTime(json['updated_at']) ?? DateTime.now();
 
-      DateTime updatedAt = DateTime.now();
-      if (json['updated_at'] != null) {
-        try {
-          updatedAt = DateTime.parse(json['updated_at'].toString());
-        } catch (e) {
-          debugPrint('⚠️ OutletSettings.fromJson: Invalid updated_at timestamp: ${json['updated_at']}');
-        }
-      }
-
-      final highlightSpecials = json['highlight_specials'] as bool? ?? true;
+      final highlightSpecials = SQLiteConverters.toBool(json['highlight_specials']) ?? true;
       final operatingHoursOpen = json['operating_hours_open']?.toString();
       final operatingHoursClose = json['operating_hours_close']?.toString();
 
       // Parse loyalty settings with defaults
-      final loyaltyEnabled = json['loyalty_enabled'] as bool? ?? true;
-      
-      double loyaltyPointsPerPound = 1.0;
-      if (json['loyalty_points_per_pound'] != null) {
-        final raw = json['loyalty_points_per_pound'];
-        if (raw is double) {
-          loyaltyPointsPerPound = raw.clamp(0.0, 10.0);
-        } else if (raw is int) {
-          loyaltyPointsPerPound = raw.toDouble().clamp(0.0, 10.0);
-        } else if (raw is String) {
-          loyaltyPointsPerPound = (double.tryParse(raw) ?? 1.0).clamp(0.0, 10.0);
-        }
-      }
-      
-      final loyaltyDoublePointsEnabled = json['loyalty_double_points_enabled'] as bool? ?? false;
+      final loyaltyEnabled = SQLiteConverters.toBool(json['loyalty_enabled']) ?? true;
+      final loyaltyPointsPerPound = (SQLiteConverters.toDouble(json['loyalty_points_per_pound']) ?? 1.0).clamp(0.0, 10.0);
+      final loyaltyDoublePointsEnabled = SQLiteConverters.toBool(json['loyalty_double_points_enabled']) ?? false;
       final loyaltyDiscountCardRestaurantId = json['loyalty_discount_card_restaurant_id']?.toString();
 
       // Clamp font sizes between 1 and 3
-      int tableNumberSize = 1;
-      if (json['table_number_size'] != null) {
-        final raw = json['table_number_size'];
-        if (raw is int) {
-          tableNumberSize = raw.clamp(1, 3);
-        } else if (raw is String) {
-          tableNumberSize = (int.tryParse(raw) ?? 1).clamp(1, 3);
-        }
-      }
-
-      int notesSize = 1;
-      if (json['notes_size'] != null) {
-        final raw = json['notes_size'];
-        if (raw is int) {
-          notesSize = raw.clamp(1, 3);
-        } else if (raw is String) {
-          notesSize = (int.tryParse(raw) ?? 1).clamp(1, 3);
-        }
-      }
-
-      int modifiersSize = 1;
-      if (json['modifiers_size'] != null) {
-        final raw = json['modifiers_size'];
-        if (raw is int) {
-          modifiersSize = raw.clamp(1, 3);
-        } else if (raw is String) {
-          modifiersSize = (int.tryParse(raw) ?? 1).clamp(1, 3);
-        }
-      }
+      final tableNumberSize = (SQLiteConverters.toInt(json['table_number_size']) ?? 1).clamp(1, 3);
+      final notesSize = (SQLiteConverters.toInt(json['notes_size']) ?? 1).clamp(1, 3);
+      final modifiersSize = (SQLiteConverters.toInt(json['modifiers_size']) ?? 1).clamp(1, 3);
 
       return OutletSettings(
         outletId: outletId,
