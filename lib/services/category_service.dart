@@ -49,6 +49,12 @@ class CategoryService {
         return localResult;
       }
       
+      // Check if offline - if so, don't fall back to Supabase
+      if (!_connectionService.isOnline) {
+        debugPrint('[LOCAL_MIRROR] ⚠️ Offline mode - local data empty, returning empty result (no Supabase fallback)');
+        return ServiceResult.success([]);
+      }
+      
       debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for categories');
     }
 

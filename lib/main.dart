@@ -383,16 +383,21 @@ class _AppShellPageState extends State<AppShellPage> {
 
     debugPrint('🔄 AppShellPage: Initializing data...');
 
-    // Set current outlet from provider
+    // Set current outlet from provider (safe - does not trigger rebuild)
     if (outletProvider.outlets.isNotEmpty) {
       navProvider.setCurrentOutlet(outletProvider.currentOutlet);
       debugPrint('   Outlet: ${outletProvider.currentOutlet?.name}');
     }
 
     // Set logged-in staff from provider
+    // DEFER to post-frame to avoid "setState during build" warning
     if (staffProvider.currentStaff != null) {
-      navProvider.setLoggedInStaff(staffProvider.currentStaff);
-      debugPrint('   Staff: ${staffProvider.currentStaff?.fullName}');
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          navProvider.setLoggedInStaff(staffProvider.currentStaff);
+          debugPrint('   Staff: ${staffProvider.currentStaff?.fullName}');
+        }
+      });
     }
 
     // Check if we need to start a new trading day based on operating hours

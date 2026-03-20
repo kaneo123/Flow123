@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flowtill/models/outlet_settings.dart';
 import 'package:flowtill/services/outlet_service.dart';
+import 'package:flowtill/services/connection_service.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
 import 'package:flowtill/database/app_database.dart';
 import 'package:flowtill/config/sync_config.dart';
@@ -8,6 +9,10 @@ import 'package:flowtill/config/sync_config.dart';
 /// Service for outlet settings operations
 class OutletSettingsService {
   final AppDatabase _db = AppDatabase.instance;
+  final ConnectionService _connectionService = ConnectionService();
+
+  /// Check if we should use local-only mode (native + offline)
+  bool get _shouldUseLocalOnly => !kIsWeb && !_connectionService.isOnline;
 
   /// Get settings for a specific outlet (local-first when flag enabled)
   Future<ServiceResult<OutletSettings>> getSettingsForOutlet(String outletId) async {
@@ -23,10 +28,16 @@ class OutletSettingsService {
         return localResult;
       }
       
+      if (_shouldUseLocalOnly) {
+        // Offline on native: Return default settings instead of Supabase fallback
+        debugPrint('[LOCAL_MIRROR] ⚠️ Offline mode - local data empty, returning default settings (no Supabase fallback)');
+        return ServiceResult.success(OutletSettings.defaults(outletId));
+      }
+      
       debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for outlet_settings');
     }
 
-    // Original Supabase logic
+    // Original Supabase logic (online or web)
     final result = await SupabaseService.selectSingle(
       'outlet_settings',
       filters: {'outlet_id': outletId},

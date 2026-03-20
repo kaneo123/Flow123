@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 class ProductModifierGroupLink {
   final String id;
   final String outletId;
@@ -28,14 +30,12 @@ class ProductModifierGroupLink {
     outletId: json['outlet_id'] as String,
     productId: json['product_id'] as String,
     groupId: json['group_id'] as String,
-    requiredOverride: json['required_override'] as bool?,
-    minSelectOverride: json['min_select_override'] as int?,
-    maxSelectOverride: json['max_select_override'] as int?,
-    sortOrder: json['sort_order'] as int? ?? 0,
-    active: json['active'] as bool? ?? true,
-    createdAt: json['created_at'] != null 
-        ? DateTime.tryParse(json['created_at'] as String) 
-        : null,
+    requiredOverride: SQLiteConverters.toBool(json['required_override']),
+    minSelectOverride: SQLiteConverters.toInt(json['min_select_override']),
+    maxSelectOverride: SQLiteConverters.toInt(json['max_select_override']),
+    sortOrder: SQLiteConverters.asInt(json['sort_order']),
+    active: SQLiteConverters.asBool(json['active'], defaultValue: true),
+    createdAt: SQLiteConverters.toDateTime(json['created_at']),
   );
 
   Map<String, dynamic> toJson() => {

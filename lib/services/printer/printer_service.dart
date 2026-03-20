@@ -9,6 +9,7 @@ import 'package:flowtill/models/printer.dart' as models;
 import 'package:flowtill/services/local_storage_service.dart';
 import 'package:flowtill/services/printer/printer_helper.dart';
 import 'package:flowtill/services/printer/local_printer_config_service.dart';
+import 'package:flowtill/services/connection_service.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
 import 'package:flowtill/database/app_database.dart';
 import 'package:flowtill/config/sync_config.dart';
@@ -59,6 +60,9 @@ class PrinterService {
 
       List<Map<String, dynamic>>? printerData;
 
+      // Check if we should use local-only mode (native + offline)
+      final shouldUseLocalOnly = !kIsWeb && !ConnectionService().isOnline;
+
       // Step 3: LOCAL MIRROR FIRST (when feature flag is enabled)
       if (kUseLocalMirrorReads && !kIsWeb) {
         debugPrint('[LOCAL_MIRROR] PrinterService: Trying local mirror first');
@@ -67,6 +71,10 @@ class PrinterService {
         if (localResult.isSuccess && localResult.data != null && localResult.data!.isNotEmpty) {
           debugPrint('[LOCAL_MIRROR] ✅ Using local data for printers (${localResult.data!.length} records, source=local)');
           printerData = localResult.data;
+        } else if (shouldUseLocalOnly) {
+          // Offline on native: Use empty list instead of Supabase fallback
+          debugPrint('[LOCAL_MIRROR] ⚠️ Offline mode - local data empty, using empty list (no Supabase fallback)');
+          printerData = [];
         } else {
           debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for printers');
         }

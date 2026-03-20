@@ -5,17 +5,26 @@ import 'package:flowtill/services/outlet_service.dart';
 import 'package:flowtill/services/outlet_settings_service.dart';
 import 'package:flowtill/services/sync_service.dart';
 import 'package:flowtill/services/local_storage_service.dart';
+import 'package:flowtill/services/outlet_availability_service.dart';
+import 'package:flowtill/services/mirror_content_sync_service.dart';
+import 'package:flowtill/services/startup_content_sync_orchestrator.dart';
+import 'package:flowtill/services/connection_service.dart';
 import 'package:flowtill/config/sync_config.dart';
 
 /// Provider for outlet state management with comprehensive error handling
 class OutletProvider with ChangeNotifier {
   final OutletService _outletService = OutletService();
   final OutletSettingsService _settingsService = OutletSettingsService();
+  final OutletAvailabilityService _availabilityService = OutletAvailabilityService();
+  final MirrorContentSyncService _mirrorSync = MirrorContentSyncService();
+  final StartupContentSyncOrchestrator _syncOrchestrator = StartupContentSyncOrchestrator();
+  final ConnectionService _connectionService = ConnectionService();
   
   List<Outlet> _outlets = [];
   Outlet? _currentOutlet;
   OutletSettings? _currentSettings;
   bool _isLoading = false;
+  bool _isSwitching = false;
   String? _errorMessage;
 
   // Getters
@@ -23,6 +32,7 @@ class OutletProvider with ChangeNotifier {
   Outlet? get currentOutlet => _currentOutlet;
   OutletSettings? get currentSettings => _currentSettings;
   bool get isLoading => _isLoading;
+  bool get isSwitching => _isSwitching;
   String? get errorMessage => _errorMessage;
   bool get hasError => _errorMessage != null;
   bool get hasOutlets => _outlets.isNotEmpty;
@@ -30,6 +40,8 @@ class OutletProvider with ChangeNotifier {
   /// Load all outlets from Supabase
   /// Always transitions through: loading → (success | error)
   Future<void> loadOutlets() async {
+    debugPrint('');
+    debugPrint('═══════════════════════════════════════════════════════════');
     debugPrint('🏪 OutletProvider: Starting to load outlets');
     
     // Set loading state
@@ -45,12 +57,39 @@ class OutletProvider with ChangeNotifier {
         _outlets = result.data!;
         _errorMessage = null;
         
-        // Auto-select first outlet if none selected
+        debugPrint('✅ OutletProvider: Loaded ${_outlets.length} outlets');
+        
+        // Auto-select outlet if none selected
+        // CRITICAL: Respect last selected outlet from startup sync to prevent mismatch
         if (_outlets.isNotEmpty && _currentOutlet == null) {
-          await setCurrentOutlet(_outlets.first);
+          final lastSelectedId = LocalStorageService().getLastSelectedOutletId();
+          
+          if (lastSelectedId != null) {
+            // Find the outlet that matches the last selected ID (from startup sync)
+            final matchedOutlet = _outlets.where((o) => o.id == lastSelectedId).firstOrNull;
+            
+            if (matchedOutlet != null) {
+              debugPrint('🏪 OutletProvider: Restoring last selected outlet from startup sync');
+              debugPrint('   Outlet ID: $lastSelectedId');
+              debugPrint('   Outlet Name: ${matchedOutlet.name}');
+              await setCurrentOutlet(matchedOutlet);
+            } else {
+              // Last selected outlet not found in list, fall back to first
+              debugPrint('⚠️ OutletProvider: Last selected outlet ($lastSelectedId) not found in loaded outlets');
+              debugPrint('   Falling back to first outlet: ${_outlets.first.name}');
+              await setCurrentOutlet(_outlets.first);
+            }
+          } else {
+            // No last selected outlet, use first
+            debugPrint('🏪 OutletProvider: No last selected outlet, using first: ${_outlets.first.name}');
+            await setCurrentOutlet(_outlets.first);
+          }
+        } else if (_currentOutlet != null) {
+          debugPrint('🏪 OutletProvider: Outlet already selected: ${_currentOutlet!.name}');
         }
         
-        debugPrint('✅ OutletProvider: Loaded ${_outlets.length} outlets');
+        debugPrint('═══════════════════════════════════════════════════════════');
+        debugPrint('');
       } else {
         // Failure: show error
         _outlets = [];
@@ -58,6 +97,8 @@ class OutletProvider with ChangeNotifier {
         _errorMessage = result.error ?? 'Failed to load outlets';
         
         debugPrint('❌ OutletProvider: Error loading outlets: $_errorMessage');
+        debugPrint('═══════════════════════════════════════════════════════════');
+        debugPrint('');
       }
     } catch (e) {
       // Unexpected error
@@ -66,6 +107,8 @@ class OutletProvider with ChangeNotifier {
       _errorMessage = 'Unexpected error: ${e.toString()}';
       
       debugPrint('❌ OutletProvider: Unexpected error: $e');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('');
     } finally {
       // Always clear loading state
       _isLoading = false;
@@ -73,32 +116,157 @@ class OutletProvider with ChangeNotifier {
     }
   }
 
-  /// Set the current outlet and load its settings
+  /// Set the current outlet with proper validation and sync
+  /// This is the GUARDED version that checks availability and syncs if needed
+  /// Returns true if outlet was switched successfully, false if blocked
+  /// 
+  /// [onReloadComplete] callback is triggered after successful switch to reload providers
+  Future<bool> setCurrentOutletWithValidation(
+    Outlet? outlet, {
+    Function()? onReloadComplete,
+  }) async {
+    if (outlet == null) {
+      debugPrint('⚠️ OutletProvider: Cannot switch - outlet is null');
+      return false;
+    }
+    
+    // Don't switch if already on this outlet
+    if (_currentOutlet?.id == outlet.id) {
+      debugPrint('🏪 OutletProvider: Already on outlet ${outlet.name}');
+      return true;
+    }
+
+    debugPrint('');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    debugPrint('🏪 OutletProvider: OUTLET SWITCH REQUESTED');
+    debugPrint('   From: ${_currentOutlet?.name ?? "None"} (${_currentOutlet?.id ?? "null"})');
+    debugPrint('   To: ${outlet.name} (${outlet.id})');
+    debugPrint('═══════════════════════════════════════════════════════════');
+
+    _isSwitching = true;
+    _errorMessage = null;
+    notifyListeners();
+
+    try {
+      // Step 1: Validate the switch
+      debugPrint('');
+      debugPrint('📋 STEP 1: Validating outlet switch...');
+      final validation = await _availabilityService.validateOutletSwitch(
+        _currentOutlet?.id ?? '',
+        outlet.id,
+      );
+
+      debugPrint('   Can switch: ${validation.canSwitch}');
+      debugPrint('   Requires sync: ${validation.requiresSync}');
+      debugPrint('   Reason: ${validation.reason}');
+
+      if (!validation.canSwitch) {
+        // Switch blocked (offline and outlet not available)
+        _errorMessage = validation.reason;
+        _isSwitching = false;
+        notifyListeners();
+        
+        debugPrint('');
+        debugPrint('❌ OUTLET SWITCH BLOCKED: ${validation.reason}');
+        debugPrint('═══════════════════════════════════════════════════════════');
+        debugPrint('');
+        return false;
+      }
+
+      // Step 2: Prepare outlet if sync required (online mode)
+      if (validation.requiresSync) {
+        debugPrint('');
+        debugPrint('🔄 STEP 2: Preparing outlet (full mirror sync + validation)...');
+        debugPrint('   This mirrors the SAME flow used during startup sync');
+        
+        if (!kIsWeb) {
+          final syncSuccess = await _syncOrchestrator.prepareOutletForUse(
+            outlet.id,
+            context: 'OUTLET_SWITCH',
+          );
+          
+          if (!syncSuccess) {
+            _errorMessage = 'Failed to prepare outlet for use. Please check your connection and try again.';
+            _isSwitching = false;
+            notifyListeners();
+            
+            debugPrint('');
+            debugPrint('❌ OUTLET PREPARATION FAILED - SWITCH ABORTED');
+            debugPrint('═══════════════════════════════════════════════════════════');
+            debugPrint('');
+            return false;
+          }
+          
+          debugPrint('');
+          debugPrint('✅ STEP 2 COMPLETE: Outlet fully prepared and validated');
+        }
+      } else {
+        debugPrint('');
+        debugPrint('ℹ️ STEP 2: Skipped (outlet already available locally)');
+      }
+
+      // Step 3: Commit the switch (only after successful preparation)
+      debugPrint('');
+      debugPrint('💾 STEP 3: Committing outlet switch...');
+      await _commitOutletSwitch(outlet, onReloadComplete: onReloadComplete);
+      
+      debugPrint('');
+      debugPrint('✅ OUTLET SWITCH COMPLETED SUCCESSFULLY');
+      debugPrint('   New outlet: ${outlet.name} (${outlet.id})');
+      debugPrint('   Providers will now reload from local mirror');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('');
+      return true;
+
+    } catch (e, stackTrace) {
+      _errorMessage = 'Failed to switch outlet: $e';
+      debugPrint('');
+      debugPrint('❌ OUTLET SWITCH EXCEPTION: $e');
+      debugPrint('Stack: $stackTrace');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('');
+      return false;
+    } finally {
+      _isSwitching = false;
+      notifyListeners();
+    }
+  }
+
+  /// Internal method to commit the outlet switch after validation and sync
+  Future<void> _commitOutletSwitch(Outlet outlet, {Function()? onReloadComplete}) async {
+    _currentOutlet = outlet;
+    
+    debugPrint('');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    debugPrint('🏪 OutletProvider: Committing outlet switch');
+    debugPrint('   Outlet ID: ${outlet.id}');
+    debugPrint('   Outlet Name: ${outlet.name}');
+    debugPrint('   Service Charge Enabled: ${outlet.enableServiceCharge}');
+    debugPrint('   Service Charge Percent: ${outlet.serviceChargePercent}%');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    debugPrint('');
+    
+    // Save last selected outlet for startup content sync
+    await LocalStorageService().saveLastSelectedOutletId(outlet.id);
+    
+    // Load settings for this outlet
+    await loadSettingsForCurrentOutlet();
+    
+    notifyListeners();
+    
+    // Trigger provider reload callback if provided
+    if (onReloadComplete != null) {
+      debugPrint('🔄 OutletProvider: Triggering provider reload for outlet switch');
+      onReloadComplete();
+    }
+  }
+
+  /// Legacy method for backward compatibility (used during initial load)
+  /// Does NOT perform validation or sync - only use during app startup
+  @Deprecated('Use setCurrentOutletWithValidation for outlet switching')
   Future<void> setCurrentOutlet(Outlet? outlet) async {
     if (outlet != null) {
-      _currentOutlet = outlet;
-      debugPrint('🏪 OutletProvider: Current outlet set to: ${outlet.name}');
-      debugPrint('   Outlet ID: ${outlet.id}');
-      debugPrint('   Service Charge Enabled: ${outlet.enableServiceCharge}');
-      debugPrint('   Service Charge Percent: ${outlet.serviceChargePercent}%');
-      
-      // Save last selected outlet for startup content sync
-      await LocalStorageService().saveLastSelectedOutletId(outlet.id);
-      
-      // Load settings for this outlet
-      await loadSettingsForCurrentOutlet();
-      
-      // Trigger sync for this outlet (only if auto-sync is enabled)
-      if (kAutoContentSyncOnStartup) {
-        debugPrint('🔄 OutletProvider: Triggering sync for outlet ${outlet.id}');
-        SyncService().syncCriticalData(outlet.id);
-      } else {
-        debugPrint('🔄 OutletProvider: Auto content sync is DISABLED for outlet ${outlet.id}');
-        debugPrint('   Outlet selected but no data downloaded');
-        debugPrint('   Trigger manual sync from Dev Settings to download data');
-      }
-      
-      notifyListeners();
+      await _commitOutletSwitch(outlet);
     }
   }
 
@@ -109,15 +277,17 @@ class OutletProvider with ChangeNotifier {
       return;
     }
 
-    debugPrint('⚙️ OutletProvider: Loading settings for outlet: ${_currentOutlet!.name}');
+    debugPrint('⚙️ OutletProvider: Loading settings');
+    debugPrint('   Outlet ID: ${_currentOutlet!.id}');
+    debugPrint('   Outlet Name: ${_currentOutlet!.name}');
     
     final result = await _settingsService.getSettingsForOutlet(_currentOutlet!.id);
     
     if (result.isSuccess && result.data != null) {
       _currentSettings = result.data;
-      debugPrint('✅ OutletProvider: Settings loaded successfully');
+      debugPrint('✅ OutletProvider: Settings loaded successfully for ${_currentOutlet!.name}');
     } else {
-      debugPrint('⚠️ OutletProvider: Failed to load settings: ${result.error}');
+      debugPrint('⚠️ OutletProvider: Failed to load settings for ${_currentOutlet!.name}: ${result.error}');
       // Use default settings if loading fails
       _currentSettings = OutletSettings(
         outletId: _currentOutlet!.id,

@@ -3,14 +3,19 @@ import 'package:flowtill/models/packaged_deal.dart';
 import 'package:flowtill/models/packaged_deal_component.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
 import 'package:flowtill/database/app_database.dart';
+import 'package:flowtill/services/connection_service.dart';
 import 'package:flowtill/config/sync_config.dart';
 
 class PackagedDealService {
   final _supabase = SupabaseConfig.client;
   final AppDatabase _db = AppDatabase.instance;
+  final ConnectionService _connectionService = ConnectionService();
 
   List<PackagedDeal> _cachedDeals = [];
   Map<String, List<PackagedDealComponent>> _dealComponents = {}; // dealId -> [components]
+
+  /// Check if we should use local-only mode (native + offline)
+  bool get _shouldUseLocalOnly => !kIsWeb && !_connectionService.isOnline;
 
   /// Load all active packaged deals for the given outlet (local-first when flag enabled)
   Future<void> loadActiveDeals(String outletId) async {
@@ -31,6 +36,12 @@ class PackagedDealService {
           componentsData = localResult['components']!;
           usedLocal = true;
           debugPrint('[LOCAL_MIRROR] ✅ Using local data for packaged_deals (${dealsData.length} deals, ${componentsData.length} components, source=local)');
+        } else if (_shouldUseLocalOnly) {
+          // Offline on native: Do NOT fall back to Supabase
+          debugPrint('[LOCAL_MIRROR] ⚠️ Offline mode - local data empty, returning empty result (no Supabase fallback)');
+          dealsData = [];
+          componentsData = [];
+          usedLocal = true;
         } else {
           debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for packaged_deals');
         }

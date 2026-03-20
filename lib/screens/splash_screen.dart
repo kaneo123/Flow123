@@ -281,9 +281,10 @@ class _SplashScreenState extends State<SplashScreen> {
     String? startupOutletId = LocalStorageService().getLastSelectedOutletId();
     
     if (startupOutletId != null) {
-      debugPrint('[STARTUP_SYNC] ✅ Last outlet found: $startupOutletId');
+      debugPrint('[STARTUP_SYNC] ✅ Last outlet ID found in LocalStorage');
+      debugPrint('[STARTUP_SYNC]    Outlet ID: $startupOutletId');
     } else {
-      debugPrint('[STARTUP_SYNC] No saved outlet, need to resolve startup outlet');
+      debugPrint('[STARTUP_SYNC] ℹ️ No saved outlet, need to resolve startup outlet');
       
       // STEP 2: Ensure outlets are available (fetch and cache if needed)
       setState(() {
@@ -299,15 +300,21 @@ class _SplashScreenState extends State<SplashScreen> {
         return;
       }
       
-      debugPrint('[STARTUP_SYNC] ✅ Startup outlet resolved: $startupOutletId');
+      debugPrint('[STARTUP_SYNC] ✅ Startup outlet resolved');
+      debugPrint('[STARTUP_SYNC]    Outlet ID: $startupOutletId');
       
       // STEP 3: Save this outlet for future launches
       await LocalStorageService().saveLastSelectedOutletId(startupOutletId);
-      debugPrint('[STARTUP_SYNC] Saved startup outlet for future launches');
+      debugPrint('[STARTUP_SYNC] ℹ️ Saved startup outlet for future launches');
     }
     
     // STEP 4: Run automatic content sync
-    debugPrint('[STARTUP_SYNC] Starting automatic content mirror sync');
+    debugPrint('');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    debugPrint('[STARTUP_SYNC] STARTING AUTOMATIC CONTENT MIRROR SYNC');
+    debugPrint('[STARTUP_SYNC] Startup Outlet ID: $startupOutletId');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    debugPrint('');
     await _performStartupContentSync(startupOutletId);
   }
   
@@ -362,8 +369,11 @@ class _SplashScreenState extends State<SplashScreen> {
     });
 
     try {
-      // Run startup content sync
-      final success = await _startupSyncOrchestrator.runStartupSync(outletId);
+      // Run startup content sync using the universal prepareOutletForUse method
+      final success = await _startupSyncOrchestrator.prepareOutletForUse(
+        outletId,
+        context: 'STARTUP_SYNC',
+      );
       
       if (!mounted) return;
       

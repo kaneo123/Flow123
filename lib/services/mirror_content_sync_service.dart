@@ -35,6 +35,7 @@ class MirrorContentSyncService {
     'orders',
     'order_items',
     'transactions',
+    'trading_days',
   ];
 
   /// Tables that should be filtered by outlet_id
@@ -44,7 +45,8 @@ class MirrorContentSyncService {
     'products',
     'staff_outlets',
     'printers',
-    'tax_rates',
+    // NOTE: tax_rates is GLOBAL/SHARED across outlets (no outlet_id column)
+    // DO NOT add tax_rates to this list - it should sync all tax rates for all outlets
     'promotions',
     'outlet_tables',
     'modifier_groups',
@@ -55,6 +57,7 @@ class MirrorContentSyncService {
     'stock_movements',
     'orders',
     'transactions',
+    'trading_days',
   ];
 
   /// Sync all mirror content for a specific outlet
@@ -132,12 +135,25 @@ class MirrorContentSyncService {
       if (outletFilteredTables.contains(tableName)) {
         query = query.eq('outlet_id', outletId);
         debugPrint('[MIRROR_SYNC]   Filtering by outlet_id: $outletId');
+        
+        // Additional logging for staff_outlets
+        if (tableName == 'staff_outlets') {
+          debugPrint('[STAFF_OUTLETS_SYNC] outlet_id filter = $outletId');
+        }
       }
 
       final response = await query;
       final rows = response as List<dynamic>;
       
       debugPrint('[MIRROR_SYNC]   Fetched ${rows.length} rows from Supabase');
+      
+      // Additional logging for staff_outlets
+      if (tableName == 'staff_outlets') {
+        debugPrint('[STAFF_OUTLETS_SYNC] source row count = ${rows.length}');
+        if (rows.isNotEmpty) {
+          debugPrint('[STAFF_OUTLETS_SYNC] sample row: ${rows.first}');
+        }
+      }
 
       // Clear existing local data for this table
       if (outletFilteredTables.contains(tableName)) {
@@ -197,6 +213,11 @@ class MirrorContentSyncService {
       await _updateContentSyncTimestamp(tableName);
 
       debugPrint('[MIRROR_SYNC]   ✅ Synced $insertedCount rows for $tableName');
+      
+      // Additional logging for staff_outlets
+      if (tableName == 'staff_outlets') {
+        debugPrint('[STAFF_OUTLETS_SYNC] local insert count = $insertedCount');
+      }
 
       return TableSyncResult(
         tableName: tableName,

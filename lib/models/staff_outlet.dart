@@ -1,3 +1,5 @@
+import 'package:flowtill/utils/sqlite_converters.dart';
+
 /// Represents a staff member's association with a specific outlet
 /// This is a junction table model for the many-to-many relationship
 class StaffOutlet {
@@ -23,10 +25,8 @@ class StaffOutlet {
       staffId: json['staff_id'] as String? ?? '',
       outletId: json['outlet_id'] as String? ?? '',
       roleId: json['role_id'] as String?,
-      active: json['active'] as bool? ?? true,
-      createdAt: json['created_at'] != null
-          ? DateTime.parse(json['created_at'] as String)
-          : DateTime.now(),
+      active: SQLiteConverters.toBool(json['active']) ?? true,
+      createdAt: SQLiteConverters.toDateTime(json['created_at']) ?? DateTime.now(),
     );
   }
 

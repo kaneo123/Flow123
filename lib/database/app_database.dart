@@ -52,7 +52,7 @@ class AppDatabase {
     
     return await openDatabase(
       dbPath,
-      version: 7,
+      version: 9,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -92,10 +92,11 @@ class AppDatabase {
       )
     ''');
 
-    // Staff table (no longer has outlet_id - uses staff_outlets junction table)
+    // Staff table (has outlet_id for legacy compatibility + uses staff_outlets junction table)
     await db.execute('''
       CREATE TABLE staff (
         id TEXT PRIMARY KEY,
+        outlet_id TEXT,
         full_name TEXT NOT NULL,
         pin_code TEXT NOT NULL,
         active INTEGER NOT NULL DEFAULT 1,
@@ -254,6 +255,28 @@ class AppDatabase {
       )
     ''');
 
+    // Trading days table
+    await db.execute('''
+      CREATE TABLE trading_days (
+        id TEXT PRIMARY KEY,
+        outlet_id TEXT NOT NULL,
+        trading_date INTEGER NOT NULL,
+        opened_at INTEGER NOT NULL,
+        opened_by_staff_id TEXT NOT NULL,
+        opening_float_amount REAL NOT NULL,
+        opening_float_source TEXT NOT NULL,
+        closed_at INTEGER,
+        closed_by_staff_id TEXT,
+        closing_cash_counted REAL,
+        cash_variance REAL,
+        carry_forward_cash REAL,
+        is_carry_forward INTEGER,
+        total_cash_sales REAL,
+        total_card_sales REAL,
+        total_sales REAL
+      )
+    ''');
+
     // Create indexes for better query performance
     await db.execute('CREATE INDEX idx_products_category ON products(category_id)');
     await db.execute('CREATE INDEX idx_orders_outlet ON orders(outlet_id)');
@@ -264,6 +287,8 @@ class AppDatabase {
     await db.execute('CREATE INDEX idx_staff_outlets_staff ON staff_outlets(staff_id)');
     await db.execute('CREATE INDEX idx_staff_outlets_outlet ON staff_outlets(outlet_id)');
     await db.execute('CREATE INDEX idx_staff_outlets_outlet_role ON staff_outlets(outlet_id, role_id)');
+    await db.execute('CREATE INDEX idx_trading_days_outlet ON trading_days(outlet_id)');
+    await db.execute('CREATE INDEX idx_trading_days_opened ON trading_days(opened_at DESC)');
 
     debugPrint('AppDatabase: Database created successfully');
   }
@@ -372,6 +397,7 @@ class AppDatabase {
       await db.execute('''
         CREATE TABLE staff_new (
           id TEXT PRIMARY KEY,
+          outlet_id TEXT,
           full_name TEXT NOT NULL,
           pin_code TEXT NOT NULL,
           active INTEGER NOT NULL DEFAULT 1,
@@ -382,12 +408,22 @@ class AppDatabase {
         )
       ''');
       
-      // Copy existing data
-      await db.execute('''
-        INSERT INTO staff_new (id, full_name, pin_code, active, associated_outlets, role_id, permission_level, updated_at)
-        SELECT id, name, pin, active, associated_outlets, role_id, permission_level, updated_at
-        FROM staff
-      ''');
+      // Copy existing data (try to copy outlet_id if it exists in old table)
+      try {
+        await db.execute('''
+          INSERT INTO staff_new (id, outlet_id, full_name, pin_code, active, associated_outlets, role_id, permission_level, updated_at)
+          SELECT id, outlet_id, name, pin, active, associated_outlets, role_id, permission_level, updated_at
+          FROM staff
+        ''');
+      } catch (e) {
+        // If outlet_id doesn't exist in old table, copy without it
+        debugPrint('⚠️ Old staff table missing outlet_id, copying without it: $e');
+        await db.execute('''
+          INSERT INTO staff_new (id, full_name, pin_code, active, associated_outlets, role_id, permission_level, updated_at)
+          SELECT id, name, pin, active, associated_outlets, role_id, permission_level, updated_at
+          FROM staff
+        ''');
+      }
       
       // Drop old table
       await db.execute('DROP TABLE staff');
@@ -396,6 +432,47 @@ class AppDatabase {
       await db.execute('ALTER TABLE staff_new RENAME TO staff');
       
       debugPrint('✅ AppDatabase: Staff table migrated to use full_name and pin_code');
+    }
+
+    if (oldVersion < 8) {
+      // Add outlet_id back to staff table for legacy compatibility
+      // This allows offline auth to fall back to staff.outlet_id when staff_outlets is not populated
+      try {
+        await db.execute('ALTER TABLE staff ADD COLUMN outlet_id TEXT');
+        debugPrint('✅ AppDatabase: Added outlet_id column to staff table for legacy compatibility');
+      } catch (e) {
+        // Column might already exist from old schema
+        debugPrint('⚠️ AppDatabase: Could not add outlet_id to staff (might already exist): $e');
+      }
+    }
+
+    if (oldVersion < 9) {
+      // Add trading_days table for offline support
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS trading_days (
+          id TEXT PRIMARY KEY,
+          outlet_id TEXT NOT NULL,
+          trading_date INTEGER NOT NULL,
+          opened_at INTEGER NOT NULL,
+          opened_by_staff_id TEXT NOT NULL,
+          opening_float_amount REAL NOT NULL,
+          opening_float_source TEXT NOT NULL,
+          closed_at INTEGER,
+          closed_by_staff_id TEXT,
+          closing_cash_counted REAL,
+          cash_variance REAL,
+          carry_forward_cash REAL,
+          is_carry_forward INTEGER,
+          total_cash_sales REAL,
+          total_card_sales REAL,
+          total_sales REAL
+        )
+      ''');
+      
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_trading_days_outlet ON trading_days(outlet_id)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_trading_days_opened ON trading_days(opened_at DESC)');
+      
+      debugPrint('✅ AppDatabase: Created trading_days table for offline support');
     }
   }
 
@@ -490,6 +567,34 @@ class AppDatabase {
       final batch = txn.batch();
       for (final staff in staffList) {
         batch.insert('staff', staff, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  // Staff outlets operations (junction table for many-to-many relationship)
+  Future<List<Map<String, dynamic>>> getStaffOutletsByStaffId(String staffId) async {
+    final db = await database;
+    return await db.query('staff_outlets', where: 'staff_id = ? AND active = 1', whereArgs: [staffId]);
+  }
+
+  Future<Map<String, dynamic>?> getStaffOutletByStaffAndOutlet(String staffId, String outletId) async {
+    final db = await database;
+    final results = await db.query('staff_outlets', where: 'staff_id = ? AND outlet_id = ? AND active = 1', whereArgs: [staffId, outletId]);
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  Future<void> insertStaffOutlet(Map<String, dynamic> staffOutlet) async {
+    final db = await database;
+    await db.insert('staff_outlets', staffOutlet, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<void> insertStaffOutlets(List<Map<String, dynamic>> staffOutlets) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final batch = txn.batch();
+      for (final staffOutlet in staffOutlets) {
+        batch.insert('staff_outlets', staffOutlet, conflictAlgorithm: ConflictAlgorithm.replace);
       }
       await batch.commit(noResult: true);
     });
@@ -731,6 +836,69 @@ class AppDatabase {
     final cutoffTime = DateTime.now().subtract(Duration(days: daysToKeep)).millisecondsSinceEpoch;
     final deleted = await db.delete('orders', where: 'created_at < ? AND synced_at IS NOT NULL', whereArgs: [cutoffTime]);
     debugPrint('🧹 AppDatabase: Cleaned up $deleted orders older than $daysToKeep days (synced only)');
+  }
+
+  // Trading days operations
+  Future<Map<String, dynamic>?> getCurrentTradingDay(String outletId) async {
+    final db = await database;
+    final results = await db.query(
+      'trading_days',
+      where: 'outlet_id = ? AND closed_at IS NULL',
+      whereArgs: [outletId],
+      orderBy: 'opened_at DESC',
+      limit: 1,
+    );
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  Future<Map<String, dynamic>?> getLastClosedTradingDay(String outletId) async {
+    final db = await database;
+    final results = await db.query(
+      'trading_days',
+      where: 'outlet_id = ? AND closed_at IS NOT NULL',
+      whereArgs: [outletId],
+      orderBy: 'closed_at DESC',
+      limit: 1,
+    );
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  Future<List<Map<String, dynamic>>> getTradingDays(String outletId, {int limit = 50}) async {
+    final db = await database;
+    return await db.query(
+      'trading_days',
+      where: 'outlet_id = ?',
+      whereArgs: [outletId],
+      orderBy: 'trading_date DESC',
+      limit: limit,
+    );
+  }
+
+  Future<Map<String, dynamic>?> getTradingDayById(String id) async {
+    final db = await database;
+    final results = await db.query('trading_days', where: 'id = ?', whereArgs: [id]);
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  Future<void> insertTradingDay(Map<String, dynamic> tradingDay) async {
+    final db = await database;
+    await db.insert('trading_days', tradingDay, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<void> insertTradingDays(List<Map<String, dynamic>> tradingDays) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final batch = txn.batch();
+      for (final tradingDay in tradingDays) {
+        batch.insert('trading_days', tradingDay, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  Future<void> updateTradingDay(String id, Map<String, dynamic> updates) async {
+    final db = await database;
+    await db.update('trading_days', updates, where: 'id = ?', whereArgs: [id]);
   }
 
   Future<void> clearAllData() async {

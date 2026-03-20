@@ -38,6 +38,7 @@ class StartupContentSyncOrchestrator {
     'modifier_groups',
     'modifier_options',
     'product_modifier_groups',
+    'trading_days', // CRITICAL: Required for Start Trading Day flows
   ];
 
   static const List<String> _bucketBSecondary = [
@@ -49,15 +50,16 @@ class StartupContentSyncOrchestrator {
 
   // Bucket C is handled separately with status filters for live operational data
 
-  /// Run automatic startup content sync
-  /// Must be called after schema sync completes
+  /// UNIVERSAL METHOD: Prepare outlet for use by syncing all required data
+  /// This is used for BOTH startup sync AND manual outlet switching
+  /// Must be called after schema sync completes (for startup) or when switching outlets
   /// Returns true if sync completed successfully, false otherwise
-  Future<bool> runStartupSync(String outletId) async {
+  Future<bool> prepareOutletForUse(String outletId, {String context = 'STARTUP'}) async {
     debugPrint('');
     debugPrint('═══════════════════════════════════════════════════════════');
-    debugPrint('[STARTUP_SYNC] AUTOMATIC STARTUP CONTENT SYNC - BEGIN');
+    debugPrint('[$context] PREPARING OUTLET FOR USE - BEGIN');
     debugPrint('═══════════════════════════════════════════════════════════');
-    debugPrint('[STARTUP_SYNC] Outlet ID: $outletId');
+    debugPrint('[$context] Outlet ID: $outletId');
 
     try {
       _updateProgress(
@@ -67,21 +69,36 @@ class StartupContentSyncOrchestrator {
       );
 
       // Bucket A: Core required data (60% of progress)
-      debugPrint('[STARTUP_SYNC] === Bucket A: Core Required Data ===');
-      await _syncBucketA(outletId);
+      debugPrint('[$context] === Bucket A: Core Required Data ===');
+      await _syncBucketA(outletId, context: context);
 
       // Bucket B: Secondary content (20% of progress)
-      debugPrint('[STARTUP_SYNC] === Bucket B: Secondary Content ===');
-      await _syncBucketB(outletId);
+      debugPrint('[$context] === Bucket B: Secondary Content ===');
+      await _syncBucketB(outletId, context: context);
 
       // Bucket C: Live operational data (20% of progress)
-      debugPrint('[STARTUP_SYNC] === Bucket C: Live Operational Data ===');
-      await _syncBucketC(outletId);
+      debugPrint('[$context] === Bucket C: Live Operational Data ===');
+      await _syncBucketC(outletId, context: context);
 
       // Run validation and diagnostics
-      debugPrint('[STARTUP_SYNC] === Running Validation & Diagnostics ===');
+      debugPrint('[$context] === Running Validation & Diagnostics ===');
       if (!kIsWeb) {
         await _validation.validateOutletData(outletId);
+        
+        // Print final sync summary
+        debugPrint('');
+        debugPrint('[$context] === FINAL SYNC SUMMARY ===');
+        debugPrint('[$context] Tables scheduled for sync:');
+        for (final table in _bucketACoreRequired) {
+          final count = await _getLocalRowCount(table, outletId);
+          debugPrint('[$context]   • $table: $count rows');
+        }
+        for (final table in _bucketBSecondary) {
+          final count = await _getLocalRowCount(table, outletId);
+          debugPrint('[$context]   • $table: $count rows');
+        }
+        debugPrint('[$context] === END SUMMARY ===');
+        debugPrint('');
       }
 
       _updateProgress(
@@ -91,14 +108,14 @@ class StartupContentSyncOrchestrator {
         isComplete: true,
       );
 
-      debugPrint('[STARTUP_SYNC] ✅ AUTOMATIC STARTUP CONTENT SYNC - SUCCESS');
+      debugPrint('[$context] ✅ OUTLET PREPARATION - SUCCESS');
       debugPrint('═══════════════════════════════════════════════════════════');
       debugPrint('');
 
       return true;
 
     } catch (e, stackTrace) {
-      debugPrint('[STARTUP_SYNC] ❌ STARTUP SYNC FAILED: $e');
+      debugPrint('[$context] ❌ OUTLET PREPARATION FAILED: $e');
       debugPrint('Stack: $stackTrace');
       
       _updateProgress(
@@ -116,8 +133,13 @@ class StartupContentSyncOrchestrator {
     }
   }
 
+  /// Backward compatibility wrapper for startup flow
+  /// Calls prepareOutletForUse with 'STARTUP_SYNC' context
+  @Deprecated('Use prepareOutletForUse() instead')
+  Future<bool> runStartupSync(String outletId) => prepareOutletForUse(outletId, context: 'STARTUP_SYNC');
+
   /// Sync Bucket A: Core required data
-  Future<void> _syncBucketA(String outletId) async {
+  Future<void> _syncBucketA(String outletId, {String context = 'STARTUP'}) async {
     final totalTables = _bucketACoreRequired.length;
     int completed = 0;
 
@@ -135,6 +157,7 @@ class StartupContentSyncOrchestrator {
       'modifier_groups': 'Loading modifiers',
       'modifier_options': 'Loading modifier options',
       'product_modifier_groups': 'Linking modifiers',
+      'trading_days': 'Loading trading days',
     };
 
     for (final tableName in _bucketACoreRequired) {
@@ -146,24 +169,28 @@ class StartupContentSyncOrchestrator {
         isRunning: true,
       );
 
-      debugPrint('[STARTUP_SYNC] Syncing core table: $tableName');
+      debugPrint('[$context] Syncing core table: $tableName');
       final result = await _mirrorSync.syncSingleTable(tableName, outletId);
       
       if (result.success) {
-        debugPrint('[STARTUP_SYNC]   ✅ $tableName: ${result.rowsSynced} rows');
+        debugPrint('[$context]   ✅ $tableName: ${result.rowsSynced} rows synced');
+        
+        // Log local row count verification
+        final localCount = await _getLocalRowCount(tableName, outletId);
+        debugPrint('[$context]   📊 $tableName: local table now has $localCount rows');
       } else {
-        debugPrint('[STARTUP_SYNC]   ⚠️ $tableName failed: ${result.error}');
+        debugPrint('[$context]   ⚠️ $tableName failed: ${result.error}');
         // Continue with other tables even if one fails
       }
 
       completed++;
     }
 
-    debugPrint('[STARTUP_SYNC] Bucket A complete: $completed/$totalTables tables');
+    debugPrint('[$context] Bucket A complete: $completed/$totalTables tables');
   }
 
   /// Sync Bucket B: Secondary content
-  Future<void> _syncBucketB(String outletId) async {
+  Future<void> _syncBucketB(String outletId, {String context = 'STARTUP'}) async {
     final totalTables = _bucketBSecondary.length;
     int completed = 0;
 
@@ -184,31 +211,35 @@ class StartupContentSyncOrchestrator {
         isRunning: true,
       );
 
-      debugPrint('[STARTUP_SYNC] Syncing secondary table: $tableName');
+      debugPrint('[$context] Syncing secondary table: $tableName');
       final result = await _mirrorSync.syncSingleTable(tableName, outletId);
       
       if (result.success) {
-        debugPrint('[STARTUP_SYNC]   ✅ $tableName: ${result.rowsSynced} rows');
+        debugPrint('[$context]   ✅ $tableName: ${result.rowsSynced} rows synced');
+        
+        // Log local row count verification
+        final localCount = await _getLocalRowCount(tableName, outletId);
+        debugPrint('[$context]   📊 $tableName: local table now has $localCount rows');
       } else {
-        debugPrint('[STARTUP_SYNC]   ⚠️ $tableName failed: ${result.error}');
+        debugPrint('[$context]   ⚠️ $tableName failed: ${result.error}');
         // Continue with other tables even if one fails
       }
 
       completed++;
     }
 
-    debugPrint('[STARTUP_SYNC] Bucket B complete: $completed/$totalTables tables');
+    debugPrint('[$context] Bucket B complete: $completed/$totalTables tables');
   }
 
   /// Sync Bucket C: Live operational data only (no historical data)
-  Future<void> _syncBucketC(String outletId) async {
+  Future<void> _syncBucketC(String outletId, {String context = 'STARTUP'}) async {
     _updateProgress(
       currentStepLabel: 'Syncing live tables...',
       percentComplete: 80,
       isRunning: true,
     );
 
-    debugPrint('[STARTUP_SYNC] Syncing live operational data...');
+    debugPrint('[$context] Syncing live operational data...');
 
     // Sync open/parked orders only
     _updateProgress(
@@ -216,10 +247,10 @@ class StartupContentSyncOrchestrator {
       percentComplete: 85,
       isRunning: true,
     );
-    await _syncLiveOrders(outletId);
+    await _syncLiveOrders(outletId, context: context);
 
     // 4. Table sessions are cloud-only (no longer synced to local mirror)
-    debugPrint('[STARTUP_SYNC] 4. Table sessions: SKIPPED (cloud-only live presence data)');
+    debugPrint('[$context] 4. Table sessions: SKIPPED (cloud-only live presence data)');
 
     _updateProgress(
       currentStepLabel: 'Almost there...',
@@ -227,16 +258,16 @@ class StartupContentSyncOrchestrator {
       isRunning: true,
     );
 
-    debugPrint('[STARTUP_SYNC] Bucket C complete');
+    debugPrint('[$context] Bucket C complete');
   }
 
   /// Sync only open/parked orders and their items
-  Future<void> _syncLiveOrders(String outletId) async {
+  Future<void> _syncLiveOrders(String outletId, {String context = 'STARTUP'}) async {
     try {
       final supabase = SupabaseConfig.client;
 
       // Fetch open/parked orders only
-      debugPrint('[STARTUP_SYNC]   Fetching open/parked orders...');
+      debugPrint('[$context]   Fetching open/parked orders...');
       final ordersResponse = await supabase
           .from('orders')
           .select()
@@ -244,19 +275,19 @@ class StartupContentSyncOrchestrator {
           .inFilter('status', ['open', 'parked']);
 
       final orders = ordersResponse as List<dynamic>;
-      debugPrint('[STARTUP_SYNC]   Found ${orders.length} active orders');
+      debugPrint('[$context]   Found ${orders.length} active orders');
 
       // Write orders to local mirror
-      final insertedOrders = await _writeOrdersToLocalMirror(orders);
+      final insertedOrders = await _writeOrdersToLocalMirror(orders, context: context);
       
       if (orders.isNotEmpty && insertedOrders == 0) {
-        debugPrint('[STARTUP_SYNC]   ⚠️ Table failed: fetched ${orders.length} orders, inserted 0');
+        debugPrint('[$context]   ⚠️ Table failed: fetched ${orders.length} orders, inserted 0');
       }
 
       // Fetch order items for these orders
       if (orders.isNotEmpty) {
         final orderIds = orders.map((o) => o['id']).toList();
-        debugPrint('[STARTUP_SYNC]   Fetching order items for active orders...');
+        debugPrint('[$context]   Fetching order items for active orders...');
         
         final itemsResponse = await supabase
             .from('order_items')
@@ -264,21 +295,21 @@ class StartupContentSyncOrchestrator {
             .inFilter('order_id', orderIds);
 
         final items = itemsResponse as List<dynamic>;
-        debugPrint('[STARTUP_SYNC]   Found ${items.length} order items');
+        debugPrint('[$context]   Found ${items.length} order items');
 
         // Write order items to local mirror
-        final insertedItems = await _writeOrderItemsToLocalMirror(items);
+        final insertedItems = await _writeOrderItemsToLocalMirror(items, context: context);
         
         if (items.isNotEmpty && insertedItems == 0) {
-          debugPrint('[STARTUP_SYNC]   ⚠️ Table failed: fetched ${items.length} order items, inserted 0');
+          debugPrint('[$context]   ⚠️ Table failed: fetched ${items.length} order items, inserted 0');
         } else {
-          debugPrint('[STARTUP_SYNC]   ✅ Order items synced: $insertedItems rows');
+          debugPrint('[$context]   ✅ Order items synced: $insertedItems rows');
         }
       }
 
-      debugPrint('[STARTUP_SYNC]   ✅ Live orders synced: $insertedOrders orders');
+      debugPrint('[$context]   ✅ Live orders synced: $insertedOrders orders');
     } catch (e, stackTrace) {
-      debugPrint('[STARTUP_SYNC]   ⚠️ Live orders sync failed: $e');
+      debugPrint('[$context]   ⚠️ Live orders sync failed: $e');
       debugPrint('Stack: $stackTrace');
       // Don't throw - allow startup to continue even if live orders fail
     }
@@ -293,13 +324,13 @@ class StartupContentSyncOrchestrator {
 
   /// Write orders to local mirror table (replace existing open/parked orders)
   /// Returns the count of successfully inserted rows
-  Future<int> _writeOrdersToLocalMirror(List<dynamic> orders) async {
+  Future<int> _writeOrdersToLocalMirror(List<dynamic> orders, {String context = 'STARTUP'}) async {
     try {
       final db = await AppDatabase.instance.database;
       
       // Get local table columns
       final localColumns = await _getLocalTableColumns(db, 'orders');
-      debugPrint('[STARTUP_SYNC]   📋 Local orders table has ${localColumns.length} columns');
+      debugPrint('[$context]   📋 Local orders table has ${localColumns.length} columns');
       
       // Delete existing open/parked orders
       await db.delete(
@@ -330,17 +361,17 @@ class StartupContentSyncOrchestrator {
           await db.insert('orders', filtered);
           insertedCount++;
         } catch (e) {
-          debugPrint('[STARTUP_SYNC]     ⚠️ Failed to insert order: $e');
+          debugPrint('[$context]     ⚠️ Failed to insert order: $e');
         }
       }
       
       if (skippedColumns.isNotEmpty) {
-        debugPrint('[STARTUP_SYNC]   ℹ️ Skipped non-existent columns during orders insert: ${skippedColumns.join(", ")}');
+        debugPrint('[$context]   ℹ️ Skipped non-existent columns during orders insert: ${skippedColumns.join(", ")}');
       }
       
       return insertedCount;
     } catch (e, stackTrace) {
-      debugPrint('[STARTUP_SYNC]   ⚠️ Failed to write orders to local mirror: $e');
+      debugPrint('[$context]   ⚠️ Failed to write orders to local mirror: $e');
       debugPrint('Stack: $stackTrace');
       return 0;
     }
@@ -348,7 +379,7 @@ class StartupContentSyncOrchestrator {
 
   /// Write order items to local mirror table
   /// Returns the count of successfully inserted rows
-  Future<int> _writeOrderItemsToLocalMirror(List<dynamic> items) async {
+  Future<int> _writeOrderItemsToLocalMirror(List<dynamic> items, {String context = 'STARTUP'}) async {
     try {
       final db = await AppDatabase.instance.database;
       
@@ -371,13 +402,13 @@ class StartupContentSyncOrchestrator {
           await db.insert('order_items', filtered);
           insertedCount++;
         } catch (e) {
-          debugPrint('[STARTUP_SYNC]     ⚠️ Failed to insert order item: $e');
+          debugPrint('[$context]     ⚠️ Failed to insert order item: $e');
         }
       }
       
       return insertedCount;
     } catch (e, stackTrace) {
-      debugPrint('[STARTUP_SYNC]   ⚠️ Failed to write order items to local mirror: $e');
+      debugPrint('[$context]   ⚠️ Failed to write order items to local mirror: $e');
       debugPrint('Stack: $stackTrace');
       return 0;
     }
@@ -417,6 +448,42 @@ class StartupContentSyncOrchestrator {
       }
     }
     return filtered;
+  }
+
+  /// Get local row count for a table (for diagnostics)
+  /// Filters by outlet_id for outlet-scoped tables
+  Future<int> _getLocalRowCount(String tableName, String outletId) async {
+    try {
+      final db = await AppDatabase.instance.database;
+      
+      // Tables that should be filtered by outlet_id
+      // NOTE: Global tables like 'outlets', 'staff', 'tax_rates', 'packaged_deal_components' have no outlet_id column
+      final outletFilteredTables = [
+        'outlet_settings', 'categories', 'products', 'staff_outlets', 'printers',
+        'promotions', 'outlet_tables', 'modifier_groups', 'modifier_options',
+        'product_modifier_groups', 'packaged_deals',
+        'inventory_items', 'stock_movements',
+        'orders', 'order_items', 'transactions', 'trading_days',
+      ];
+      
+      String query;
+      List<dynamic> args;
+      
+      if (outletFilteredTables.contains(tableName)) {
+        query = 'SELECT COUNT(*) as count FROM $tableName WHERE outlet_id = ?';
+        args = [outletId];
+      } else {
+        // Global tables (outlets, staff, tax_rates, packaged_deal_components) - no outlet_id filter
+        query = 'SELECT COUNT(*) as count FROM $tableName';
+        args = [];
+      }
+      
+      final result = await db.rawQuery(query, args);
+      return result.first['count'] as int;
+    } catch (e) {
+      debugPrint('[STARTUP_SYNC] ⚠️ Failed to get row count for $tableName: $e');
+      return 0;
+    }
   }
 
   /// Update progress and emit to stream

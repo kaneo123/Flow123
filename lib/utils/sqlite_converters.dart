@@ -23,6 +23,42 @@ class SQLiteConverters {
     return null;
   }
 
+  /// Safely convert a value to non-nullable bool with default
+  /// Use this when you need a guaranteed bool value
+  static bool asBool(dynamic value, {bool defaultValue = false}) {
+    return toBool(value) ?? defaultValue;
+  }
+
+  /// Safely convert a value to String
+  /// Handles: String, int, double, bool, null
+  static String? toStringValue(dynamic value) {
+    if (value == null) return null;
+    
+    try {
+      if (value is String) return value;
+      return value.toString();
+    } catch (e) {
+      debugPrint('⚠️ SQLiteConverters.toStringValue: Failed to convert $value (${value.runtimeType}): $e');
+    }
+    
+    return null;
+  }
+
+  /// Safely convert a value to non-nullable String with default
+  static String asString(dynamic value, {String defaultValue = ''}) {
+    return toStringValue(value) ?? defaultValue;
+  }
+
+  /// Safely convert a value to non-nullable int with default
+  static int asInt(dynamic value, {int defaultValue = 0}) {
+    return toInt(value) ?? defaultValue;
+  }
+
+  /// Safely convert a value to non-nullable double with default
+  static double asDouble(dynamic value, {double defaultValue = 0.0}) {
+    return toDouble(value) ?? defaultValue;
+  }
+
   /// Safely convert a value to int
   /// Handles: int, double, String, null
   static int? toInt(dynamic value) {

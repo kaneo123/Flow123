@@ -5,6 +5,9 @@ import 'package:flowtill/providers/staff_provider.dart';
 import 'package:flowtill/providers/outlet_provider.dart';
 import 'package:flowtill/providers/order_provider.dart';
 import 'package:flowtill/providers/catalog_provider.dart';
+import 'package:flowtill/providers/trading_day_provider.dart';
+import 'package:flowtill/models/outlet.dart';
+import 'package:flowtill/services/startup_content_sync_orchestrator.dart';
 import 'package:flowtill/theme.dart';
 
 /// Full-screen staff login page with PIN entry
@@ -36,21 +39,34 @@ class _StaffLoginScreenState extends State<StaffLoginScreen> {
     final outletProvider = context.read<OutletProvider>();
     final catalogProvider = context.read<CatalogProvider>();
     
+    debugPrint('');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    debugPrint('🚀 LoginScreen: Initializing login data');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    
     // Load outlets first
     await outletProvider.loadOutlets();
     
     // If an outlet is available, preload catalog in the background
     final currentOutlet = outletProvider.currentOutlet;
     if (currentOutlet != null && !_catalogPreloaded) {
-      debugPrint('🚀 LoginScreen: Preloading catalog for outlet: ${currentOutlet.name}');
+      debugPrint('');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('🚀 LoginScreen: Preloading catalog');
+      debugPrint('   Outlet ID: ${currentOutlet.id}');
+      debugPrint('   Outlet Name: ${currentOutlet.name}');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('');
       _catalogPreloaded = true;
       
       // Load catalog in background (non-blocking)
       catalogProvider.loadCatalog(currentOutlet.id).then((_) {
-        debugPrint('✅ LoginScreen: Catalog preloaded successfully');
+        debugPrint('✅ LoginScreen: Catalog preloaded successfully for ${currentOutlet.name}');
       }).catchError((e) {
         debugPrint('❌ LoginScreen: Catalog preload failed - $e');
       });
+    } else if (currentOutlet == null) {
+      debugPrint('⚠️ LoginScreen: No outlet available for catalog preload');
     }
   }
 
@@ -221,7 +237,6 @@ class _OutletSelectorState extends State<_OutletSelector> {
   @override
   Widget build(BuildContext context) {
     final outletProvider = context.watch<OutletProvider>();
-    final catalogProvider = context.read<CatalogProvider>();
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
 
@@ -364,17 +379,113 @@ class _OutletSelectorState extends State<_OutletSelector> {
       onChanged: (value) {
         if (value != null) {
           final outlet = outletProvider.outlets.firstWhere((o) => o.id == value);
-          outletProvider.setCurrentOutlet(outlet);
-          
-          // Reload catalog when outlet changes
-          if (_previousOutletId != value) {
-            debugPrint('🔄 LoginScreen: Outlet changed, reloading catalog...');
-            _previousOutletId = value;
-            catalogProvider.loadCatalog(value);
-          }
+          _handleOutletChange(context, outlet);
         }
       },
     );
+  }
+
+  /// Handle outlet change with full preparation flow
+  void _handleOutletChange(BuildContext context, Outlet newOutlet) async {
+    final outletProvider = context.read<OutletProvider>();
+    final catalogProvider = context.read<CatalogProvider>();
+    final staffProvider = context.read<StaffProvider>();
+    final orderProvider = context.read<OrderProvider>();
+    final tradingDayProvider = context.read<TradingDayProvider>();
+    
+    debugPrint('');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    debugPrint('🔄 LoginScreen: User manually changed outlet');
+    debugPrint('   New Outlet ID: ${newOutlet.id}');
+    debugPrint('   New Outlet Name: ${newOutlet.name}');
+    debugPrint('   MUST run full preparation before commit');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    debugPrint('');
+    
+    // Store previous outlet ID to detect actual changes
+    if (_previousOutletId == newOutlet.id) {
+      debugPrint('⚠️ LoginScreen: Same outlet selected, skipping preparation');
+      return;
+    }
+    _previousOutletId = newOutlet.id;
+    
+    // Show rich progress dialog (mirroring startup sync UI)
+    // IMPORTANT: Dialog has auto-close logic, so we just await it
+    // Do NOT manually pop - it will close itself when sync completes
+    final dialogFuture = showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => const _LoginOutletSyncProgressDialog(),
+    );
+    
+    // Run the guarded outlet switch with full preparation
+    // CRITICAL: This will run prepareOutletForUse() BEFORE committing the outlet
+    final success = await outletProvider.setCurrentOutletWithValidation(
+      newOutlet,
+      onReloadComplete: () => _reloadProvidersAfterSwitch(
+        context,
+        newOutlet,
+        catalogProvider,
+        orderProvider,
+        staffProvider,
+        tradingDayProvider,
+      ),
+    );
+    
+    // Wait for dialog to auto-close (dialog closes itself when sync completes or errors)
+    await dialogFuture;
+    debugPrint('ℹ️ LoginScreen: Progress dialog closed');
+    
+    if (!success && context.mounted) {
+      // Show error
+      final errorMessage = outletProvider.errorMessage ?? 'Failed to switch outlet';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(errorMessage),
+          backgroundColor: Theme.of(context).colorScheme.error,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+      
+      debugPrint('❌ LoginScreen: Outlet preparation failed, switch aborted');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('');
+    } else {
+      debugPrint('✅ LoginScreen: Outlet switch complete and catalog preloaded');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('');
+    }
+  }
+
+  /// Reload providers after outlet switch
+  void _reloadProvidersAfterSwitch(
+    BuildContext context,
+    Outlet newOutlet,
+    CatalogProvider catalogProvider,
+    OrderProvider orderProvider,
+    StaffProvider staffProvider,
+    TradingDayProvider tradingDayProvider,
+  ) {
+    debugPrint('');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    debugPrint('🔄 LoginScreen: RELOADING PROVIDERS after outlet switch');
+    debugPrint('   New Outlet: ${newOutlet.name} (${newOutlet.id})');
+    debugPrint('═══════════════════════════════════════════════════════════');
+    
+    // Load catalog and trading day (minimal set for login screen)
+    Future.wait([
+      catalogProvider.loadCatalog(newOutlet.id),
+      tradingDayProvider.loadCurrentTradingDay(newOutlet.id),
+    ]).then((_) {
+      debugPrint('✅ LoginScreen: Providers reloaded successfully');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('');
+    }).catchError((e, stackTrace) {
+      debugPrint('❌ LoginScreen: Error reloading providers: $e');
+      debugPrint('Stack: $stackTrace');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('');
+    });
   }
 }
 
@@ -611,6 +722,86 @@ class _NumericKeypad extends StatelessWidget {
           ),
         );
       }).toList(),
+    );
+  }
+}
+
+/// Progress dialog for outlet switching during login
+class _LoginOutletSyncProgressDialog extends StatelessWidget {
+  const _LoginOutletSyncProgressDialog();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    
+    return StreamBuilder(
+      stream: StartupContentSyncOrchestrator().progressStream,
+      builder: (context, snapshot) {
+        final progress = snapshot.data ?? StartupContentSyncOrchestrator().currentProgress;
+        
+        // Auto-close dialog when complete
+        if (progress.isComplete && !progress.isRunning) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (context.mounted) {
+              Navigator.of(context).pop(true);
+            }
+          });
+        }
+        
+        return AlertDialog(
+          title: Row(
+            children: [
+              Icon(Icons.sync, color: colorScheme.primary),
+              const SizedBox(width: AppSpacing.sm),
+              const Expanded(child: Text('Preparing Outlet')),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (progress.errorMessage != null) ...[
+                Icon(Icons.error_outline, color: colorScheme.error, size: 48),
+                const SizedBox(height: AppSpacing.md),
+                Text(
+                  'Sync Failed',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    color: colorScheme.error,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: AppSpacing.sm),
+                Text(progress.errorMessage!, style: theme.textTheme.bodyMedium),
+              ] else ...[
+                LinearProgressIndicator(value: progress.percentComplete / 100),
+                const SizedBox(height: AppSpacing.md),
+                Text(
+                  progress.currentStepLabel,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: AppSpacing.xs),
+                Text(
+                  '${progress.percentComplete}%',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ],
+          ),
+          actions: progress.errorMessage != null
+              ? [
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(false),
+                    child: const Text('Close'),
+                  ),
+                ]
+              : null,
+        );
+      },
     );
   }
 }

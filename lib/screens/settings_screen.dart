@@ -1243,9 +1243,26 @@ class _SyncStatusPanelState extends State<_SyncStatusPanel> {
       final outboxResult = await db.rawQuery('SELECT COUNT(*) as count FROM outbox_queue');
       final outboxCount = (outboxResult.first['count'] as int?) ?? 0;
       
-      // Count local orders
-      final ordersResult = await db.rawQuery('SELECT COUNT(*) as count FROM orders WHERE synced_at IS NULL');
-      final ordersCount = (ordersResult.first['count'] as int?) ?? 0;
+      // Count local orders (safe query that doesn't rely on synced_at column)
+      // The local orders table doesn't have synced_at, so we just count all local orders
+      int ordersCount = 0;
+      try {
+        // Check if synced_at column exists
+        final columnsResult = await db.rawQuery('PRAGMA table_info(orders)');
+        final hasSyncedAt = columnsResult.any((col) => col['name'] == 'synced_at');
+        
+        if (hasSyncedAt) {
+          final ordersResult = await db.rawQuery('SELECT COUNT(*) as count FROM orders WHERE synced_at IS NULL');
+          ordersCount = (ordersResult.first['count'] as int?) ?? 0;
+        } else {
+          // Just count all local orders
+          final ordersResult = await db.rawQuery('SELECT COUNT(*) as count FROM orders');
+          ordersCount = (ordersResult.first['count'] as int?) ?? 0;
+        }
+      } catch (e) {
+        debugPrint('⚠️ Failed to count local orders: $e');
+        ordersCount = 0;
+      }
       
       // Get connection status
       final isOnline = _connectionService.isOnline;

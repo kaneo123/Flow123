@@ -39,6 +39,25 @@ class OutletSettings {
     required this.updatedAt,
   });
 
+  /// Create default settings for offline mode or missing data
+  factory OutletSettings.defaults(String outletId) {
+    final now = DateTime.now();
+    return OutletSettings(
+      outletId: outletId,
+      printOrderTicketsOnOrderAway: true,
+      orderTicketCopies: 1,
+      tableNumberSize: 1,
+      notesSize: 1,
+      modifiersSize: 1,
+      highlightSpecials: true,
+      loyaltyEnabled: true,
+      loyaltyPointsPerPound: 1.0,
+      loyaltyDoublePointsEnabled: false,
+      createdAt: now,
+      updatedAt: now,
+    );
+  }
+
   factory OutletSettings.fromJson(Map<String, dynamic> json) {
     try {
       final outletId = json['outlet_id']?.toString() ?? '';

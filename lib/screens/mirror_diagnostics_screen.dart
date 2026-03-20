@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:flowtill/theme.dart';
 import 'package:flowtill/services/mirror_content_sync_service.dart';
+import 'package:flowtill/services/outlet_availability_service.dart';
 import 'package:flowtill/providers/outlet_provider.dart';
 import 'package:intl/intl.dart';
 
@@ -16,8 +17,10 @@ class MirrorDiagnosticsScreen extends StatefulWidget {
 
 class _MirrorDiagnosticsScreenState extends State<MirrorDiagnosticsScreen> {
   final _mirrorService = MirrorContentSyncService();
+  final _availabilityService = OutletAvailabilityService();
   
   MirrorDiagnostics? _diagnostics;
+  OutletAvailabilityResult? _availability;
   bool _isLoading = false;
   bool _isSyncing = false;
   String? _currentAction;
@@ -36,11 +39,17 @@ class _MirrorDiagnosticsScreenState extends State<MirrorDiagnosticsScreen> {
       final outletId = outletProvider.currentOutlet?.id;
 
       debugPrint('[DEV_SYNC] Loading mirror diagnostics for outlet: $outletId');
+      
+      // Load both diagnostics and availability status
       final diagnostics = await _mirrorService.getMirrorDiagnostics(outletId);
+      final availability = outletId != null 
+          ? await _availabilityService.isOutletAvailableOffline(outletId)
+          : null;
 
       if (mounted) {
         setState(() {
           _diagnostics = diagnostics;
+          _availability = availability;
           _isLoading = false;
         });
       }
@@ -354,6 +363,65 @@ class _MirrorDiagnosticsScreenState extends State<MirrorDiagnosticsScreen> {
               ],
             ),
           ),
+
+          // Outlet Availability Status
+          if (_availability != null)
+            Container(
+              margin: AppSpacing.paddingMd,
+              padding: AppSpacing.paddingMd,
+              decoration: BoxDecoration(
+                color: _availability!.isAvailable 
+                    ? Colors.green.withValues(alpha: 0.1)
+                    : Colors.orange.withValues(alpha: 0.1),
+                border: Border.all(
+                  color: _availability!.isAvailable 
+                      ? Colors.green 
+                      : Colors.orange,
+                  width: 2,
+                ),
+                borderRadius: BorderRadius.circular(AppRadius.md),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        _availability!.isAvailable 
+                            ? Icons.check_circle 
+                            : Icons.warning,
+                        color: _availability!.isAvailable 
+                            ? Colors.green 
+                            : Colors.orange,
+                      ),
+                      const SizedBox(width: AppSpacing.sm),
+                      Text(
+                        'Offline Availability',
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: AppSpacing.sm),
+                  Text(
+                    _availability!.isAvailable
+                        ? 'This outlet is fully available for offline use'
+                        : 'This outlet is NOT available for offline use',
+                    style: theme.textTheme.bodyMedium,
+                  ),
+                  if (!_availability!.isAvailable && _availability!.emptyTables.isNotEmpty) ...[
+                    const SizedBox(height: AppSpacing.xs),
+                    Text(
+                      'Missing data: ${_availability!.emptyTables.join(", ")}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: Colors.orange.shade700,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
 
           // Table list
           Expanded(

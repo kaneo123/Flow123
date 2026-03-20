@@ -55,13 +55,14 @@ class StartupValidationService {
   }
 
   /// Get row counts from local SQLite mirror tables
+  /// Filters by outlet_id for outlet-scoped tables
   Future<Map<String, int>> _getLocalRowCounts(String outletId) async {
     final counts = <String, int>{};
     
-    final tables = [
+    // Outlet-scoped tables (have outlet_id column)
+    final outletFilteredTables = [
       'categories',
       'products',
-      'tax_rates',
       'staff_outlets',
       'printers',
       'outlet_tables',
@@ -72,16 +73,37 @@ class StartupValidationService {
       'product_modifier_groups',
       'promotions',
     ];
+    
+    // Global tables (no outlet_id - shared across all outlets)
+    final globalTables = [
+      'tax_rates',
+      'packaged_deal_components',
+    ];
 
     final db = await _db.database;
     
-    for (final table in tables) {
+    // Count outlet-scoped tables WITH outlet_id filter
+    for (final table in outletFilteredTables) {
+      try {
+        final result = await db.rawQuery(
+          'SELECT COUNT(*) as count FROM $table WHERE outlet_id = ?',
+          [outletId],
+        );
+        counts[table] = result.first['count'] as int;
+      } catch (e) {
+        debugPrint('[VALIDATION] ⚠️ Could not count local $table: $e');
+        counts[table] = -1; // -1 indicates table doesn't exist or query failed
+      }
+    }
+    
+    // Count global tables WITHOUT outlet_id filter
+    for (final table in globalTables) {
       try {
         final result = await db.rawQuery('SELECT COUNT(*) as count FROM $table');
         counts[table] = result.first['count'] as int;
       } catch (e) {
         debugPrint('[VALIDATION] ⚠️ Could not count local $table: $e');
-        counts[table] = -1; // -1 indicates table doesn't exist or query failed
+        counts[table] = -1;
       }
     }
 
@@ -89,13 +111,14 @@ class StartupValidationService {
   }
 
   /// Get row counts from Supabase for comparison
+  /// Filters by outlet_id for outlet-scoped tables
   Future<Map<String, int>> _getSupabaseRowCounts(String outletId) async {
     final counts = <String, int>{};
     
+    // Outlet-scoped tables (have outlet_id column)
     final outletFilteredTables = [
       'categories',
       'products',
-      'tax_rates',
       'staff_outlets',
       'printers',
       'outlet_tables',
@@ -106,14 +129,35 @@ class StartupValidationService {
       'product_modifier_groups',
       'promotions',
     ];
+    
+    // Global tables (no outlet_id - shared across all outlets)
+    final globalTables = [
+      'tax_rates',
+      'packaged_deal_components',
+    ];
 
     try {
+      // Count outlet-scoped tables WITH outlet_id filter
       for (final table in outletFilteredTables) {
         try {
           final response = await SupabaseConfig.client
               .from(table)
               .select('id')
               .eq('outlet_id', outletId);
+          
+          counts[table] = (response as List).length;
+        } catch (e) {
+          debugPrint('[VALIDATION] ⚠️ Could not count Supabase $table: $e');
+          counts[table] = -1;
+        }
+      }
+      
+      // Count global tables WITHOUT outlet_id filter
+      for (final table in globalTables) {
+        try {
+          final response = await SupabaseConfig.client
+              .from(table)
+              .select('id');
           
           counts[table] = (response as List).length;
         } catch (e) {
@@ -134,7 +178,12 @@ class StartupValidationService {
     
     try {
       final db = await _db.database;
-      final result = await db.query('categories');
+      // Filter categories by outlet to avoid false positives across outlets
+      final result = await db.query(
+        'categories',
+        where: 'outlet_id = ?',
+        whereArgs: [outletId],
+      );
       
       if (result.isEmpty) {
         return issues;
@@ -153,12 +202,12 @@ class StartupValidationService {
         nameMap[nameLower]!.add(row);
       }
 
-      // Detect duplicates and case variations
+      // Detect exact duplicates only (case-insensitive)
       for (final entry in nameMap.entries) {
         final categories = entry.value;
         
         if (categories.length > 1) {
-          // Multiple categories with same name (case-insensitive)
+          // Multiple categories with same name (case-insensitive) within same outlet
           final names = categories.map((c) => c['name'] as String).toList();
           final ids = categories.map((c) => c['id'] as String).toList();
           
@@ -171,24 +220,7 @@ class StartupValidationService {
         }
       }
 
-      // Detect likely naming issues (spelling variants, extra spaces, etc.)
-      final allNames = result.map((r) => r['name'] as String).toList();
-      for (int i = 0; i < allNames.length; i++) {
-        for (int j = i + 1; j < allNames.length; j++) {
-          final name1 = allNames[i].trim();
-          final name2 = allNames[j].trim();
-          
-          // Check if names are very similar (differ by 1-2 characters)
-          if (_areNamesSimilar(name1, name2)) {
-            issues.add(CategoryQualityIssue(
-              type: 'similar_name',
-              message: 'Similar category names detected: "$name1" vs "$name2"',
-              categoryIds: [result[i]['id'] as String, result[j]['id'] as String],
-              categoryNames: [name1, name2],
-            ));
-          }
-        }
-      }
+      // REMOVED: Similar name detection - too noisy and flags legitimate variations like "Drinks" vs "Drink"
 
     } catch (e) {
       debugPrint('[VALIDATION] ⚠️ Could not check category quality: $e');

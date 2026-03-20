@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:sqflite/sqflite.dart';
 import 'package:flowtill/models/staff.dart' as models;
 import 'package:flowtill/database/app_database.dart';
 import 'package:flowtill/services/outlet_service.dart';
@@ -85,7 +86,12 @@ class StaffService {
       // Cache to local DB for offline access (on mobile/desktop only)
       if (!kIsWeb) {
         try {
-          await _db.insertStaffList([{
+          // Get local staff table columns to filter data safely
+          final db = await _db.database;
+          final localColumns = await _getLocalTableColumns(db, 'staff');
+          
+          // Prepare staff data for caching
+          final staffData = {
             'id': staff.id,
             'full_name': staff.fullName,
             'pin_code': staff.pinCode,
@@ -94,8 +100,21 @@ class StaffService {
             'associated_outlets': associatedOutletIds.join(','),
             'role_id': roleId,
             'permission_level': permissionLevel,
-          }]);
-          debugPrint('💾 StaffService: Cached staff authentication data');
+            'outlet_id': outletId, // For legacy compatibility
+          };
+          
+          // Filter to only include columns that exist in local table
+          final filteredData = <String, dynamic>{};
+          for (final entry in staffData.entries) {
+            if (localColumns.contains(entry.key)) {
+              filteredData[entry.key] = entry.value;
+            } else {
+              debugPrint('   ℹ️ Skipping column ${entry.key} (not in local staff table)');
+            }
+          }
+          
+          await _db.insertStaffList([filteredData]);
+          debugPrint('💾 StaffService: Cached staff authentication data (${filteredData.length} columns)');
         } catch (e) {
           debugPrint('⚠️ StaffService: Failed to cache staff (non-fatal): $e');
         }
@@ -109,44 +128,94 @@ class StaffService {
   }
 
   /// Offline authentication from local cache
+  /// Uses staff_outlets junction table for association-based auth
+  /// Falls back to legacy staff.outlet_id for compatibility
   Future<ServiceResult<models.Staff>> _authenticateStaffOffline(String pin, String outletId) async {
+    debugPrint('[OFFLINE_AUTH] entered outlet: $outletId');
+    
     try {
-      final result = await _db.getStaffByPin(pin);
+      // Step A: Query local staff by PIN and active flag
+      final staffRow = await _db.getStaffByPin(pin);
       
-      if (result == null) {
-        debugPrint('❌ StaffService: Invalid PIN (offline)');
+      if (staffRow == null) {
+        debugPrint('[OFFLINE_AUTH] final result = failure (invalid PIN)');
         return ServiceResult.failure('Invalid PIN');
       }
 
-      final staff = _mapToModel(result);
+      final staffId = staffRow['id'] as String;
+      final fullName = staffRow['full_name'] as String;
+      final pinCode = staffRow['pin_code'] as String;
+      final active = (staffRow['active'] as int? ?? 0) == 1;
       
-      if (!staff.active) {
-        debugPrint('❌ StaffService: Staff member is inactive');
+      debugPrint('[OFFLINE_AUTH] matched local staff: $fullName / $staffId');
+      
+      if (!active) {
+        debugPrint('[OFFLINE_AUTH] final result = failure (staff inactive)');
         return ServiceResult.failure('Staff member is inactive');
       }
 
-      // Check outlet association from cached data
-      final associatedOutlets = result['associated_outlets'] as String?;
-      if (associatedOutlets == null || associatedOutlets.isEmpty) {
-        debugPrint('⚠️ StaffService: No outlet associations cached (offline). Allowing access.');
-        return ServiceResult.success(staff.copyWith(outletId: outletId));
+      // Step B: Query local staff_outlets for association
+      final staffOutletRow = await _db.getStaffOutletByStaffAndOutlet(staffId, outletId);
+      
+      debugPrint('[OFFLINE_AUTH] local staff_outlets rows found: ${staffOutletRow != null ? 1 : 0}');
+      
+      if (staffOutletRow != null) {
+        // Association found - use staff_outlets.role_id
+        debugPrint('[OFFLINE_AUTH] association match found');
+        
+        final roleId = staffOutletRow['role_id'] as String?;
+        debugPrint('[OFFLINE_AUTH] role source = staff_outlets.role_id');
+        
+        final staff = models.Staff(
+          id: staffId,
+          fullName: fullName,
+          pinCode: pinCode,
+          active: active,
+          outletId: outletId,
+          roleId: roleId,
+          createdAt: DateTime.now(),
+          associatedOutletIds: [outletId],
+        );
+        
+        debugPrint('[OFFLINE_AUTH] final result = success (via staff_outlets)');
+        return ServiceResult.success(staff);
       }
-
-      final outletIds = associatedOutlets.split(',');
-      if (!outletIds.contains(outletId)) {
-        debugPrint('❌ StaffService: Staff member is not associated with this outlet (offline)');
-        return ServiceResult.failure('You do not have access to this outlet');
+      
+      // Step C: Fallback to legacy staff.outlet_id for compatibility
+      debugPrint('[OFFLINE_AUTH] falling back to legacy staff.outlet_id');
+      
+      final legacyOutletId = staffRow['outlet_id'] as String?;
+      
+      if (legacyOutletId != null && legacyOutletId == outletId) {
+        debugPrint('[OFFLINE_AUTH] legacy match success');
+        
+        final roleId = staffRow['role_id'] as String?;
+        debugPrint('[OFFLINE_AUTH] role source = staff.role_id');
+        
+        final staff = models.Staff(
+          id: staffId,
+          fullName: fullName,
+          pinCode: pinCode,
+          active: active,
+          outletId: outletId,
+          roleId: roleId,
+          createdAt: DateTime.now(),
+          associatedOutletIds: [outletId],
+        );
+        
+        debugPrint('[OFFLINE_AUTH] final result = success (via legacy staff.outlet_id)');
+        return ServiceResult.success(staff);
       }
-
-      debugPrint('✅ StaffService: Authentication successful (offline) for ${staff.fullName}');
-      return ServiceResult.success(staff.copyWith(
-        outletId: outletId,
-        associatedOutletIds: outletIds,
-        roleId: result['role_id'] as String?,
-        permissionLevel: result['permission_level'] as int?,
-      ));
-    } catch (e) {
+      
+      // Step D: No association found
+      debugPrint('[OFFLINE_AUTH] legacy match failure');
+      debugPrint('[OFFLINE_AUTH] final result = failure (no outlet access)');
+      return ServiceResult.failure('No offline access for this outlet');
+      
+    } catch (e, stackTrace) {
+      debugPrint('[OFFLINE_AUTH] final result = failure (exception)');
       debugPrint('❌ StaffService: Offline authentication error: $e');
+      debugPrint('Stack: $stackTrace');
       return ServiceResult.failure('Authentication failed: ${e.toString()}');
     }
   }
@@ -167,6 +236,22 @@ class StaffService {
       roleId: map['role_id'] as String?,
       permissionLevel: map['permission_level'] as int?,
     );
+  }
+
+  /// Get list of column names for a local table (for safe schema-agnostic inserts)
+  Future<Set<String>> _getLocalTableColumns(Database db, String tableName) async {
+    try {
+      final result = await db.rawQuery('PRAGMA table_info($tableName)');
+      final columns = <String>{};
+      for (final row in result) {
+        final columnName = row['name'] as String;
+        columns.add(columnName);
+      }
+      return columns;
+    } catch (e) {
+      debugPrint('⚠️ StaffService: Failed to get columns for $tableName: $e');
+      return {};
+    }
   }
 
   // Backwards compatibility method (deprecated)

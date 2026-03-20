@@ -2,11 +2,16 @@ import 'package:flutter/foundation.dart';
 import 'package:flowtill/models/tax_rate.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
 import 'package:flowtill/services/outlet_service.dart';
+import 'package:flowtill/services/connection_service.dart';
 import 'package:flowtill/database/app_database.dart';
 import 'package:flowtill/config/sync_config.dart';
 
 class TaxRateService {
   final AppDatabase _db = AppDatabase.instance;
+  final ConnectionService _connectionService = ConnectionService();
+
+  /// Check if we should use local-only mode (native + offline)
+  bool get _shouldUseLocalOnly => !kIsWeb && !_connectionService.isOnline;
 
   Future<ServiceResult<List<TaxRate>>> getAllTaxRates() async {
     debugPrint('💰 TaxRateService: Fetching all tax rates');
@@ -21,10 +26,16 @@ class TaxRateService {
         return localResult;
       }
       
+      if (_shouldUseLocalOnly) {
+        // Offline on native: Return empty list instead of Supabase fallback
+        debugPrint('[LOCAL_MIRROR] ⚠️ Offline mode - local data empty, returning empty list (no Supabase fallback)');
+        return ServiceResult.success([]);
+      }
+      
       debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for tax_rates');
     }
 
-    // Original Supabase logic
+    // Original Supabase logic (online or web)
     final result = await SupabaseService.select('tax_rates', orderBy: 'name');
 
     if (!result.isSuccess) {

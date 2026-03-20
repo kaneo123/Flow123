@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flowtill/models/outlet.dart';
 import 'package:flowtill/models/staff.dart';
 
@@ -71,15 +72,25 @@ class NavigationProvider extends ChangeNotifier {
   }
 
   /// Set the current outlet
+  /// Uses post-frame callback to avoid setState during build
   void setCurrentOutlet(Outlet? outlet) {
     _currentOutlet = outlet;
-    notifyListeners();
+    
+    // Schedule notification for after current frame to avoid setState during build
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      notifyListeners();
+    });
   }
 
   /// Set the logged-in staff member
+  /// Uses post-frame callback to avoid setState during build
   void setLoggedInStaff(Staff? staff) {
     _loggedInStaff = staff;
-    notifyListeners();
+    
+    // Schedule notification for after current frame to avoid setState during build
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      notifyListeners();
+    });
   }
 
   /// Set online/offline status

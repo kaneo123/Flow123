@@ -4,6 +4,7 @@ import 'package:flowtill/models/modifier_option.dart';
 import 'package:flowtill/models/product_modifier_group_link.dart';
 import 'package:flowtill/supabase/supabase_config.dart';
 import 'package:flowtill/database/app_database.dart';
+import 'package:flowtill/services/connection_service.dart';
 import 'package:flowtill/config/sync_config.dart';
 import 'package:flowtill/services/outlet_service.dart';
 
@@ -46,6 +47,7 @@ class ModifierGroupRules {
 /// Service for managing product modifiers
 class ModifierService {
   final AppDatabase _db = AppDatabase.instance;
+  final ConnectionService _connectionService = ConnectionService();
 
   // Cache maps
   final Map<String, ProductModifierGroupLink> _linksByProductId = {};
@@ -54,6 +56,9 @@ class ModifierService {
   final Map<String, List<ModifierOption>> _optionsByGroupId = {};
   
   bool _isLoaded = false;
+
+  /// Check if we should use local-only mode (native + offline)
+  bool get _shouldUseLocalOnly => !kIsWeb && !_connectionService.isOnline;
 
   /// Load all modifier data for an outlet (local-first when flag enabled)
   Future<bool> loadModifiersForOutlet(String outletId) async {
@@ -76,6 +81,13 @@ class ModifierService {
           options = localResult['options'] as List<ModifierOption>;
           usedLocal = true;
           debugPrint('[LOCAL_MIRROR] ✅ Using local data for modifiers (links=${links.length}, groups=${groups.length}, options=${options.length}, source=local)');
+        } else if (_shouldUseLocalOnly) {
+          // Offline on native: Do NOT fall back to Supabase
+          debugPrint('[LOCAL_MIRROR] ⚠️ Offline mode - local data empty, returning empty result (no Supabase fallback)');
+          links = [];
+          groups = [];
+          options = [];
+          usedLocal = true;
         } else {
           debugPrint('[LOCAL_MIRROR] Local data unavailable, falling back to Supabase for modifiers');
         }
