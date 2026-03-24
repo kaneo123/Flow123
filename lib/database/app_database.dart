@@ -834,7 +834,20 @@ class AppDatabase {
   Future<void> cleanupOldOrders(int daysToKeep) async {
     final db = await database;
     final cutoffTime = DateTime.now().subtract(Duration(days: daysToKeep)).millisecondsSinceEpoch;
-    final deleted = await db.delete('orders', where: 'created_at < ? AND synced_at IS NOT NULL', whereArgs: [cutoffTime]);
+    
+    // Check if table has sync_status column
+    final tableInfo = await db.rawQuery('PRAGMA table_info(orders)');
+    final hasSyncStatus = tableInfo.any((col) => col['name'] == 'sync_status');
+    
+    int deleted;
+    if (hasSyncStatus) {
+      // Use sync_status='synced' for new offline sync system
+      deleted = await db.delete('orders', where: 'created_at < ? AND sync_status = ?', whereArgs: [cutoffTime, 'synced']);
+    } else {
+      // Fallback: delete all old orders if no sync tracking
+      deleted = await db.delete('orders', where: 'created_at < ?', whereArgs: [cutoffTime]);
+    }
+    
     debugPrint('🧹 AppDatabase: Cleaned up $deleted orders older than $daysToKeep days (synced only)');
   }
 

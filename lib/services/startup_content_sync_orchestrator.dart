@@ -324,6 +324,8 @@ class StartupContentSyncOrchestrator {
 
   /// Write orders to local mirror table (replace existing open/parked orders)
   /// Returns the count of successfully inserted rows
+  /// 
+  /// CRITICAL: Uses importMirroredRow to ensure cloud-origin orders are marked as synced
   Future<int> _writeOrdersToLocalMirror(List<dynamic> orders, {String context = 'STARTUP'}) async {
     try {
       final db = await AppDatabase.instance.database;
@@ -332,6 +334,12 @@ class StartupContentSyncOrchestrator {
       final localColumns = await _getLocalTableColumns(db, 'orders');
       debugPrint('[$context]   📋 Local orders table has ${localColumns.length} columns');
       
+      // Check if table has offline sync support
+      final hasOfflineSupport = localColumns.contains('sync_status');
+      if (hasOfflineSupport) {
+        debugPrint('[$context]   ✅ orders table has offline sync columns');
+      }
+      
       // Delete existing open/parked orders
       await db.delete(
         'orders',
@@ -339,37 +347,29 @@ class StartupContentSyncOrchestrator {
         whereArgs: ['open', 'parked'],
       );
 
-      // Insert new orders
-      int insertedCount = 0;
-      final Set<String> skippedColumns = {};
+      // Import new orders using safe mirror import path
+      int importedCount = 0;
       
       for (final order in orders) {
         try {
           final orderData = order as Map<String, dynamic>;
-          final sanitized = _mirrorSync.sanitizeDataForSQLite(orderData);
           
-          // Filter to only include columns that exist in local table
-          final filtered = _filterToLocalColumns(sanitized, localColumns);
+          // CRITICAL: Use importMirroredRow to ensure sync_status='synced'
+          // This is a cloud-origin row, NOT a locally-created row
+          await _mirrorSync.importMirroredRow('orders', orderData, context: context);
+          importedCount++;
           
-          // Track skipped columns
-          for (final key in sanitized.keys) {
-            if (!localColumns.contains(key)) {
-              skippedColumns.add(key);
-            }
-          }
-          
-          await db.insert('orders', filtered);
-          insertedCount++;
         } catch (e) {
-          debugPrint('[$context]     ⚠️ Failed to insert order: $e');
+          debugPrint('[$context]     ⚠️ Failed to import order: $e');
         }
       }
       
-      if (skippedColumns.isNotEmpty) {
-        debugPrint('[$context]   ℹ️ Skipped non-existent columns during orders insert: ${skippedColumns.join(", ")}');
+      // Validate sync status after import
+      if (hasOfflineSupport && importedCount > 0) {
+        await _validateBucketCSyncStatus(db, 'orders', context: context);
       }
       
-      return insertedCount;
+      return importedCount;
     } catch (e, stackTrace) {
       debugPrint('[$context]   ⚠️ Failed to write orders to local mirror: $e');
       debugPrint('Stack: $stackTrace');
@@ -379,6 +379,8 @@ class StartupContentSyncOrchestrator {
 
   /// Write order items to local mirror table
   /// Returns the count of successfully inserted rows
+  /// 
+  /// CRITICAL: Uses importMirroredRow to ensure cloud-origin items are marked as synced
   Future<int> _writeOrderItemsToLocalMirror(List<dynamic> items, {String context = 'STARTUP'}) async {
     try {
       final db = await AppDatabase.instance.database;
@@ -386,27 +388,37 @@ class StartupContentSyncOrchestrator {
       // Get local table columns
       final localColumns = await _getLocalTableColumns(db, 'order_items');
       
+      // Check if table has offline sync support
+      final hasOfflineSupport = localColumns.contains('sync_status');
+      if (hasOfflineSupport) {
+        debugPrint('[$context]   ✅ order_items table has offline sync columns');
+      }
+      
       // For order items, we'll replace all since we only have active orders
       await db.delete('order_items');
 
-      // Insert new items
-      int insertedCount = 0;
+      // Import new items using safe mirror import path
+      int importedCount = 0;
       for (final item in items) {
         try {
           final itemData = item as Map<String, dynamic>;
-          final sanitized = _mirrorSync.sanitizeDataForSQLite(itemData);
           
-          // Filter to only include columns that exist in local table
-          final filtered = _filterToLocalColumns(sanitized, localColumns);
+          // CRITICAL: Use importMirroredRow to ensure sync_status='synced'
+          // This is a cloud-origin row, NOT a locally-created row
+          await _mirrorSync.importMirroredRow('order_items', itemData, context: context);
+          importedCount++;
           
-          await db.insert('order_items', filtered);
-          insertedCount++;
         } catch (e) {
-          debugPrint('[$context]     ⚠️ Failed to insert order item: $e');
+          debugPrint('[$context]     ⚠️ Failed to import order item: $e');
         }
       }
       
-      return insertedCount;
+      // Validate sync status after import
+      if (hasOfflineSupport && importedCount > 0) {
+        await _validateBucketCSyncStatus(db, 'order_items', context: context);
+      }
+      
+      return importedCount;
     } catch (e, stackTrace) {
       debugPrint('[$context]   ⚠️ Failed to write order items to local mirror: $e');
       debugPrint('Stack: $stackTrace');
@@ -503,6 +515,48 @@ class StartupContentSyncOrchestrator {
     );
 
     _progressController.add(_currentProgress);
+  }
+
+  /// Validate Bucket C sync status after import
+  /// Ensures cloud-origin operational data is marked as synced
+  Future<void> _validateBucketCSyncStatus(Database db, String tableName, {String context = 'STARTUP'}) async {
+    try {
+      final syncedResult = await db.rawQuery(
+        'SELECT COUNT(*) as count FROM $tableName WHERE sync_status = ?',
+        ['synced'],
+      );
+      final synced = syncedResult.first['count'] as int;
+      
+      final pendingResult = await db.rawQuery(
+        'SELECT COUNT(*) as count FROM $tableName WHERE sync_status = ?',
+        ['pending'],
+      );
+      final pending = pendingResult.first['count'] as int;
+      
+      debugPrint('[$context]   📊 Bucket C validation for $tableName:');
+      debugPrint('[$context]      - Synced (cloud-origin): $synced');
+      debugPrint('[$context]      - Pending (should be 0): $pending');
+      
+      if (pending > 0) {
+        debugPrint('[$context]   ⚠️ WARNING: $pending Bucket C rows incorrectly marked as pending');
+        
+        // Log sample
+        final samplePending = await db.query(
+          tableName,
+          where: 'sync_status = ?',
+          whereArgs: ['pending'],
+          limit: 3,
+        );
+        
+        for (final row in samplePending) {
+          debugPrint('[$context]      - Incorrect pending row: id=${row['id']}');
+        }
+      } else {
+        debugPrint('[$context]   ✅ VALIDATION PASSED: All Bucket C rows marked as synced');
+      }
+    } catch (e) {
+      debugPrint('[$context]   ⚠️ Failed to validate Bucket C sync status: $e');
+    }
   }
 
   /// Dispose resources

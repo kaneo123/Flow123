@@ -59,6 +59,13 @@ class MirrorContentSyncService {
     'transactions',
     'trading_days',
   ];
+  
+  /// Tables with offline sync support (require special metadata handling)
+  static const Set<String> offlineEnabledTables = {
+    'orders',
+    'order_items',
+    'transactions',
+  };
 
   /// Sync all mirror content for a specific outlet
   Future<SyncAllResult> syncAllMirrorContent(String outletId) async {
@@ -85,6 +92,9 @@ class MirrorContentSyncService {
       debugPrint('[MIRROR_SYNC] Tables synced: ${results.length}');
       debugPrint('═══════════════════════════════════════════════════════════');
       debugPrint('');
+      
+      // Final validation: Summary of sync status for offline-enabled tables
+      await _validateOverallSyncStatus(outletId);
 
       return SyncAllResult(
         success: true,
@@ -171,9 +181,16 @@ class MirrorContentSyncService {
       // Get local table columns once for efficiency
       final localColumns = await _getLocalTableColumns(db, tableName);
       debugPrint('[MIRROR_SYNC]   📋 Local table has ${localColumns.length} columns: ${localColumns.join(", ")}');
+      
+      // Check if this table has offline sync support
+      final hasOfflineSupport = localColumns.contains('sync_status');
+      if (hasOfflineSupport) {
+        debugPrint('[MIRROR_SYNC]   ✅ Table has offline sync columns - mirrored records will be marked as "synced"');
+      }
 
-      // Insert data into local mirror
+      // Insert data into local mirror using safe upsert pattern
       int insertedCount = 0;
+      int updatedCount = 0;
       int skippedColumns = 0;
       final Set<String> skippedColumnNames = {};
       
@@ -193,14 +210,35 @@ class MirrorContentSyncService {
             }
           }
           
-          await db.insert(
-            tableName,
-            filteredData,
-            conflictAlgorithm: ConflictAlgorithm.replace,
-          );
-          insertedCount++;
+          // CRITICAL: Mark mirrored records as 'synced' since they came from Supabase
+          // Only locally-created records should be marked as 'pending'
+          if (localColumns.contains('sync_status')) {
+            filteredData['sync_status'] = 'synced';
+            filteredData['sync_error'] = null;
+            filteredData['last_sync_attempt_at'] = null;
+            filteredData['sync_attempt_count'] = 0;
+            filteredData['device_id'] = null;
+          }
+          
+          // SAFE UPSERT: Update existing row first, insert if not exists
+          // This prevents REPLACE from deleting and recreating rows (which wipes metadata)
+          final rowId = filteredData['id'];
+          final wasInserted = await _safeUpsert(db, tableName, filteredData, rowId);
+          
+          if (wasInserted) {
+            insertedCount++;
+          } else {
+            updatedCount++;
+          }
+          
+          // Debug logging for offline-enabled tables - log first 3 rows
+          if (hasOfflineSupport && (insertedCount + updatedCount) <= 3) {
+            final syncStatus = filteredData['sync_status'] ?? 'NOT_SET';
+            final action = wasInserted ? 'INSERTED' : 'UPDATED';
+            debugPrint('[MIRROR_SYNC]   📥 $action row: id=$rowId, sync_status=$syncStatus, uploadable=false (cloud-origin)');
+          }
         } catch (e) {
-          debugPrint('[MIRROR_SYNC]   ⚠️ Failed to insert row: $e');
+          debugPrint('[MIRROR_SYNC]   ⚠️ Failed to upsert row: $e');
         }
       }
       
@@ -212,17 +250,23 @@ class MirrorContentSyncService {
       // Update content sync timestamp
       await _updateContentSyncTimestamp(tableName);
 
-      debugPrint('[MIRROR_SYNC]   ✅ Synced $insertedCount rows for $tableName');
+      final totalSynced = insertedCount + updatedCount;
+      debugPrint('[MIRROR_SYNC]   ✅ Synced $totalSynced rows for $tableName (inserted: $insertedCount, updated: $updatedCount)');
       
       // Additional logging for staff_outlets
       if (tableName == 'staff_outlets') {
-        debugPrint('[STAFF_OUTLETS_SYNC] local insert count = $insertedCount');
+        debugPrint('[STAFF_OUTLETS_SYNC] local upsert count = $totalSynced');
+      }
+      
+      // Validation: Verify sync_status for offline-enabled tables
+      if (hasOfflineSupport && totalSynced > 0) {
+        await _validateMirrorSyncStatus(db, tableName, outletId);
       }
 
       return TableSyncResult(
         tableName: tableName,
         success: true,
-        rowsSynced: insertedCount,
+        rowsSynced: totalSynced,
       );
     } catch (e, stackTrace) {
       debugPrint('[MIRROR_SYNC]   ❌ Failed to sync $tableName: $e');
@@ -234,6 +278,87 @@ class MirrorContentSyncService {
         rowsSynced: 0,
         error: e.toString(),
       );
+    }
+  }
+  
+  /// Safe upsert: Update existing row, insert if not exists
+  /// Returns true if inserted, false if updated
+  /// This prevents REPLACE from deleting and recreating rows
+  Future<bool> _safeUpsert(
+    Database db,
+    String tableName,
+    Map<String, dynamic> data,
+    dynamic rowId,
+  ) async {
+    if (rowId == null) {
+      // No ID provided, just insert
+      await db.insert(tableName, data);
+      return true;
+    }
+    
+    // Try update first
+    final updateCount = await db.update(
+      tableName,
+      data,
+      where: 'id = ?',
+      whereArgs: [rowId],
+    );
+    
+    if (updateCount > 0) {
+      // Row existed and was updated
+      return false;
+    } else {
+      // Row doesn't exist, insert it
+      await db.insert(tableName, data);
+      return true;
+    }
+  }
+  
+  /// Import mirrored row with explicit cloud-origin metadata
+  /// PUBLIC method for use by other services (e.g., Bucket C import)
+  /// 
+  /// IMPORTANT: This method is ONLY for cloud-origin rows downloaded from Supabase.
+  /// Do NOT use this for locally-created rows.
+  Future<void> importMirroredRow(
+    String tableName,
+    Map<String, dynamic> rowData, {
+    String context = 'IMPORT',
+  }) async {
+    try {
+      final db = await _db.database;
+      
+      // Get local table columns
+      final localColumns = await _getLocalTableColumns(db, tableName);
+      
+      // Sanitize and filter data
+      final sanitized = sanitizeDataForSQLite(rowData);
+      final filtered = <String, dynamic>{};
+      for (final entry in sanitized.entries) {
+        if (localColumns.contains(entry.key)) {
+          filtered[entry.key] = entry.value;
+        }
+      }
+      
+      // CRITICAL: Mark as synced for cloud-origin rows
+      if (localColumns.contains('sync_status')) {
+        filtered['sync_status'] = 'synced';
+        filtered['sync_error'] = null;
+        filtered['last_sync_attempt_at'] = null;
+        filtered['sync_attempt_count'] = 0;
+        filtered['device_id'] = null;
+      }
+      
+      // Safe upsert
+      final rowId = filtered['id'];
+      final wasInserted = await _safeUpsert(db, tableName, filtered, rowId);
+      
+      final action = wasInserted ? 'INSERTED' : 'UPDATED';
+      debugPrint('[$context]   📥 $action mirrored row to $tableName: id=$rowId, sync_status=synced');
+      
+    } catch (e, stackTrace) {
+      debugPrint('[$context]   ⚠️ Failed to import mirrored row to $tableName: $e');
+      debugPrint('Stack: $stackTrace');
+      rethrow;
     }
   }
 
@@ -527,6 +652,138 @@ class MirrorContentSyncService {
       );
     } catch (e) {
       debugPrint('[MIRROR_SYNC] ⚠️ Failed to update content sync timestamp: $e');
+    }
+  }
+  
+  /// Validate mirror sync status after import
+  /// Ensures mirrored cloud-origin rows are not marked as pending
+  Future<void> _validateMirrorSyncStatus(Database db, String tableName, String outletId) async {
+    try {
+      // Count rows by sync_status
+      String whereClause = '';
+      List<dynamic> whereArgs = [];
+      
+      if (outletFilteredTables.contains(tableName)) {
+        whereClause = 'outlet_id = ?';
+        whereArgs = [outletId];
+      }
+      
+      final syncedCountResult = await db.rawQuery(
+        'SELECT COUNT(*) as count FROM $tableName WHERE ${whereClause.isNotEmpty ? "$whereClause AND " : ""}sync_status = ?',
+        [...whereArgs, 'synced'],
+      );
+      final syncedCount = syncedCountResult.first['count'] as int;
+      
+      final pendingCountResult = await db.rawQuery(
+        'SELECT COUNT(*) as count FROM $tableName WHERE ${whereClause.isNotEmpty ? "$whereClause AND " : ""}sync_status = ?',
+        [...whereArgs, 'pending'],
+      );
+      final pendingCount = pendingCountResult.first['count'] as int;
+      
+      debugPrint('[MIRROR_SYNC]   📊 Sync status validation for $tableName:');
+      debugPrint('[MIRROR_SYNC]      - Synced (cloud-origin): $syncedCount');
+      debugPrint('[MIRROR_SYNC]      - Pending (local-created): $pendingCount');
+      
+      if (pendingCount > 0) {
+        debugPrint('[MIRROR_SYNC]   ⚠️ WARNING: $pendingCount mirrored rows have sync_status=pending (should be 0)');
+        
+        // Log sample pending rows for debugging
+        final samplePending = await db.query(
+          tableName,
+          where: '${whereClause.isNotEmpty ? "$whereClause AND " : ""}sync_status = ?',
+          whereArgs: [...whereArgs, 'pending'],
+          limit: 3,
+        );
+        
+        for (final row in samplePending) {
+          debugPrint('[MIRROR_SYNC]      - Pending row sample: id=${row['id']}, sync_status=${row['sync_status']}');
+        }
+      } else {
+        debugPrint('[MIRROR_SYNC]   ✅ VALIDATION PASSED: No mirrored rows marked as pending');
+      }
+    } catch (e) {
+      debugPrint('[MIRROR_SYNC]   ⚠️ Failed to validate sync status: $e');
+    }
+  }
+  
+  /// Validate overall sync status across all offline-enabled tables
+  /// This final check ensures cloud-origin rows are never marked as pending
+  Future<void> _validateOverallSyncStatus(String outletId) async {
+    try {
+      final db = await _db.database;
+      
+      debugPrint('');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('[MIRROR_SYNC] 🔍 FINAL SYNC STATUS VALIDATION');
+      debugPrint('═══════════════════════════════════════════════════════════');
+      
+      int totalPending = 0;
+      int totalSynced = 0;
+      bool allValid = true;
+      
+      for (final tableName in offlineEnabledTables) {
+        // Check if table exists and has sync_status column
+        final tableExists = await _localTableExists(db, tableName);
+        if (!tableExists) {
+          debugPrint('[MIRROR_SYNC]   ⏭️ $tableName: table does not exist locally');
+          continue;
+        }
+        
+        final columns = await _getLocalTableColumns(db, tableName);
+        if (!columns.contains('sync_status')) {
+          debugPrint('[MIRROR_SYNC]   ⏭️ $tableName: no sync_status column');
+          continue;
+        }
+        
+        // Count by sync_status
+        String whereClause = '';
+        List<dynamic> whereArgs = [];
+        
+        if (outletFilteredTables.contains(tableName)) {
+          whereClause = 'outlet_id = ?';
+          whereArgs = [outletId];
+        }
+        
+        final syncedResult = await db.rawQuery(
+          'SELECT COUNT(*) as count FROM $tableName WHERE ${whereClause.isNotEmpty ? "$whereClause AND " : ""}sync_status = ?',
+          [...whereArgs, 'synced'],
+        );
+        final synced = syncedResult.first['count'] as int;
+        
+        final pendingResult = await db.rawQuery(
+          'SELECT COUNT(*) as count FROM $tableName WHERE ${whereClause.isNotEmpty ? "$whereClause AND " : ""}sync_status = ?',
+          [...whereArgs, 'pending'],
+        );
+        final pending = pendingResult.first['count'] as int;
+        
+        totalSynced += synced;
+        totalPending += pending;
+        
+        final status = pending == 0 ? '✅' : '⚠️';
+        debugPrint('[MIRROR_SYNC]   $status $tableName: synced=$synced, pending=$pending');
+        
+        if (pending > 0) {
+          allValid = false;
+        }
+      }
+      
+      debugPrint('[MIRROR_SYNC]');
+      debugPrint('[MIRROR_SYNC]   📊 SUMMARY:');
+      debugPrint('[MIRROR_SYNC]      Total cloud-origin (synced): $totalSynced');
+      debugPrint('[MIRROR_SYNC]      Total local-created (pending): $totalPending');
+      
+      if (allValid) {
+        debugPrint('[MIRROR_SYNC]   ✅ VALIDATION PASSED: All mirrored rows marked as synced');
+      } else {
+        debugPrint('[MIRROR_SYNC]   ⚠️ VALIDATION WARNING: Some mirrored rows may be marked as pending');
+        debugPrint('[MIRROR_SYNC]      This could cause duplicate uploads during outbound sync');
+      }
+      
+      debugPrint('═══════════════════════════════════════════════════════════');
+      debugPrint('');
+    } catch (e, stackTrace) {
+      debugPrint('[MIRROR_SYNC]   ❌ Overall validation failed: $e');
+      debugPrint('Stack: $stackTrace');
     }
   }
 }

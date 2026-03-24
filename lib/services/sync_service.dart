@@ -408,6 +408,10 @@ class SyncService {
   }
 
   /// Process outbox queue - upload pending changes to Supabase
+  /// CRITICAL: Process in correct order to respect foreign key constraints:
+  /// 1. orders first (parent table)
+  /// 2. order_items second (references orders)
+  /// 3. transactions last (references orders)
   Future<void> _processOutboxQueue() async {
     debugPrint('⬆️ Processing outbox queue...');
 
@@ -419,32 +423,47 @@ class SyncService {
 
     debugPrint('  📤 Processing ${pendingItems.length} pending items');
     
-    int successCount = 0;
-    int failCount = 0;
+    // Group items by entity type for ordered processing
+    final orderItems = <Map<String, dynamic>>[];
+    final orderItemItems = <Map<String, dynamic>>[];
+    final transactionItems = <Map<String, dynamic>>[];
+    final otherItems = <Map<String, dynamic>>[];
     
     for (final item in pendingItems) {
-      try {
-        final itemId = item['id'] as int;
-        final entityType = item['entity_type'] as String;
-        final entityId = item['entity_id'] as String;
-        final retryCount = item['retry_count'] as int? ?? 0;
-        
-        debugPrint('  📦 Processing item #$itemId: $entityType ($entityId) - Retry: $retryCount');
-        
-        await _processOutboxItem(item);
-        await _db.markOutboxItemProcessed(itemId);
-        
-        successCount++;
-        debugPrint('  ✅ Item #$itemId synced successfully');
-      } catch (e, stackTrace) {
-        failCount++;
-        final itemId = item['id'] as int;
-        final entityType = item['entity_type'] as String;
-        debugPrint('  ❌ Failed to process outbox item #$itemId ($entityType): $e');
-        debugPrint('  Stack: ${stackTrace.toString().substring(0, 200)}...');
-        await _db.incrementOutboxRetry(itemId, e.toString());
+      final entityType = item['entity_type'] as String;
+      switch (entityType) {
+        case 'order':
+          orderItems.add(item);
+          break;
+        case 'order_item':
+          orderItemItems.add(item);
+          break;
+        case 'transaction':
+          transactionItems.add(item);
+          break;
+        default:
+          otherItems.add(item);
       }
     }
+    
+    debugPrint('[OUTBOX_SYNC] Grouped items: ${orderItems.length} orders, ${orderItemItems.length} order_items, ${transactionItems.length} transactions, ${otherItems.length} other');
+    
+    final stats = {
+      'orders_success': 0,
+      'orders_fail': 0,
+      'order_items_success': 0,
+      'order_items_fail': 0,
+      'transactions_success': 0,
+      'transactions_fail': 0,
+      'other_success': 0,
+      'other_fail': 0,
+    };
+    
+    // Process in order: orders -> order_items -> transactions -> other
+    await _processBatch('order', orderItems, stats);
+    await _processBatch('order_item', orderItemItems, stats);
+    await _processBatch('transaction', transactionItems, stats);
+    await _processBatch('other', otherItems, stats);
 
     // Delete items that have failed too many times (more than 5 retries)
     final deletedCount = await _db.deleteFailedOutboxItems(5);
@@ -452,7 +471,52 @@ class SyncService {
       debugPrint('  🗑️ Deleted $deletedCount failed items (exceeded retry limit)');
     }
 
-    debugPrint('  ✅ Outbox queue processed: $successCount succeeded, $failCount failed');
+    // Summary
+    debugPrint('[OUTBOX_SYNC] ═══════════════════════════════════════');
+    debugPrint('[OUTBOX_SYNC] Final pass summary:');
+    debugPrint('[OUTBOX_SYNC]   orders: ${stats['orders_success']}/${orderItems.length} success');
+    debugPrint('[OUTBOX_SYNC]   order_items: ${stats['order_items_success']}/${orderItemItems.length} success');
+    debugPrint('[OUTBOX_SYNC]   transactions: ${stats['transactions_success']}/${transactionItems.length} success');
+    debugPrint('[OUTBOX_SYNC]   other: ${stats['other_success']}/${otherItems.length} success');
+    debugPrint('[OUTBOX_SYNC] ═══════════════════════════════════════');
+  }
+
+  /// Process a batch of outbox items of the same type
+  Future<void> _processBatch(String batchType, List<Map<String, dynamic>> items, Map<String, int> stats) async {
+    if (items.isEmpty) return;
+    
+    debugPrint('[OUTBOX_SYNC] Processing ${items.length} $batchType items...');
+    
+    for (final item in items) {
+      try {
+        final itemId = item['id'] as int;
+        final entityType = item['entity_type'] as String;
+        final entityId = item['entity_id'] as String;
+        final retryCount = item['retry_count'] as int? ?? 0;
+        
+        debugPrint('  📦 Processing #$itemId: $entityType ($entityId) - Retry: $retryCount');
+        
+        await _processOutboxItem(item);
+        await _db.markOutboxItemProcessed(itemId);
+        
+        // Update stats
+        final successKey = batchType == 'other' ? 'other_success' : '${batchType}s_success';
+        stats[successKey] = (stats[successKey] ?? 0) + 1;
+        
+        debugPrint('  ✅ Item #$itemId synced successfully');
+      } catch (e, stackTrace) {
+        final itemId = item['id'] as int;
+        final entityType = item['entity_type'] as String;
+        
+        // Update stats
+        final failKey = batchType == 'other' ? 'other_fail' : '${batchType}s_fail';
+        stats[failKey] = (stats[failKey] ?? 0) + 1;
+        
+        debugPrint('  ❌ Failed to process #$itemId ($entityType): $e');
+        debugPrint('  Stack: ${stackTrace.toString().length > 200 ? stackTrace.toString().substring(0, 200) + '...' : stackTrace.toString()}');
+        await _db.incrementOutboxRetry(itemId, e.toString());
+      }
+    }
   }
 
   /// Process a single outbox item
@@ -466,20 +530,73 @@ class SyncService {
     switch (entityType) {
       case 'order':
         if (operation == 'insert') {
-          // Insert order into Supabase
-          await supabase.from('orders').insert(payload);
-          debugPrint('    ✅ Uploaded order $entityId');
+          // Strip local-only fields and items array before uploading
+          final cleanPayload = _cleanOrderPayloadForUpload(payload);
+          debugPrint('[OUTBOX_SYNC] Uploading order $entityId with payload keys: ${cleanPayload.keys.toList()}');
+          
+          try {
+            await supabase.from('orders').insert(cleanPayload);
+            debugPrint('[OUTBOX_SYNC] ✅ Order sync success: $entityId');
+            
+            // Mark local row as synced
+            await _markLocalRowSynced('orders', entityId);
+          } catch (e) {
+            debugPrint('[OUTBOX_SYNC] ❌ Order sync failure: $entityId - $e');
+            rethrow;
+          }
         } else if (operation == 'update') {
-          // Update order in Supabase
-          await supabase.from('orders').update(payload).eq('id', entityId);
-          debugPrint('    ✅ Updated order $entityId');
+          // Strip local-only fields for updates too
+          final cleanPayload = _cleanOrderPayloadForUpload(payload);
+          debugPrint('[OUTBOX_SYNC] Updating order $entityId with payload keys: ${cleanPayload.keys.toList()}');
+          
+          try {
+            await supabase.from('orders').update(cleanPayload).eq('id', entityId);
+            debugPrint('[OUTBOX_SYNC] ✅ Order update success: $entityId');
+            
+            // Mark local row as synced
+            await _markLocalRowSynced('orders', entityId);
+          } catch (e) {
+            debugPrint('[OUTBOX_SYNC] ❌ Order update failure: $entityId - $e');
+            rethrow;
+          }
+        }
+        break;
+
+      case 'order_item':
+        if (operation == 'insert') {
+          // Strip local-only fields before uploading
+          final cleanPayload = _cleanOrderItemPayloadForUpload(payload);
+          debugPrint('[OUTBOX_SYNC] Uploading order_item $entityId with payload keys: ${cleanPayload.keys.toList()}');
+          
+          try {
+            await supabase.from('order_items').insert(cleanPayload);
+            debugPrint('[OUTBOX_SYNC] ✅ Order item sync success: $entityId');
+            
+            // Mark local row as synced
+            await _markLocalRowSynced('order_items', entityId);
+          } catch (e) {
+            debugPrint('[OUTBOX_SYNC] ❌ Order item sync failure: $entityId - $e');
+            rethrow;
+          }
         }
         break;
 
       case 'transaction':
         if (operation == 'insert') {
-          await supabase.from('transactions').insert(payload);
-          debugPrint('    ✅ Uploaded transaction $entityId');
+          // Strip local-only fields before uploading
+          final cleanPayload = _cleanTransactionPayloadForUpload(payload);
+          debugPrint('[OUTBOX_SYNC] Uploading transaction $entityId with payload keys: ${cleanPayload.keys.toList()}');
+          
+          try {
+            await supabase.from('transactions').insert(cleanPayload);
+            debugPrint('[OUTBOX_SYNC] ✅ Transaction sync success: $entityId');
+            
+            // Mark local row as synced
+            await _markLocalRowSynced('transactions', entityId);
+          } catch (e) {
+            debugPrint('[OUTBOX_SYNC] ❌ Transaction sync failure: $entityId - $e');
+            rethrow;
+          }
         }
         break;
 
@@ -497,6 +614,84 @@ class SyncService {
 
       default:
         debugPrint('    ⚠️ Unknown entity type: $entityType');
+    }
+  }
+
+  /// Clean order payload for Supabase upload
+  /// Removes local-only fields and items array
+  Map<String, dynamic> _cleanOrderPayloadForUpload(Map<String, dynamic> payload) {
+    final clean = Map<String, dynamic>.from(payload);
+    
+    // Remove local-only sync metadata columns
+    clean.remove('sync_status');
+    clean.remove('sync_error');
+    clean.remove('last_sync_attempt_at');
+    clean.remove('sync_attempt_count');
+    clean.remove('device_id');
+    
+    // Remove items array - order_items are uploaded separately
+    clean.remove('items');
+    
+    // Remove modifiers array if present - shouldn't be in orders table
+    clean.remove('modifiers');
+    
+    return clean;
+  }
+
+  /// Clean order_item payload for Supabase upload
+  /// Removes local-only fields
+  Map<String, dynamic> _cleanOrderItemPayloadForUpload(Map<String, dynamic> payload) {
+    final clean = Map<String, dynamic>.from(payload);
+    
+    // Remove local-only sync metadata columns
+    clean.remove('sync_status');
+    clean.remove('sync_error');
+    clean.remove('last_sync_attempt_at');
+    clean.remove('sync_attempt_count');
+    clean.remove('device_id');
+    
+    return clean;
+  }
+
+  /// Clean transaction payload for Supabase upload
+  /// Removes local-only fields
+  Map<String, dynamic> _cleanTransactionPayloadForUpload(Map<String, dynamic> payload) {
+    final clean = Map<String, dynamic>.from(payload);
+    
+    // Remove local-only sync metadata columns
+    clean.remove('sync_status');
+    clean.remove('sync_error');
+    clean.remove('last_sync_attempt_at');
+    clean.remove('sync_attempt_count');
+    clean.remove('device_id');
+    
+    return clean;
+  }
+
+  /// Mark a local row as synced after successful upload
+  Future<void> _markLocalRowSynced(String tableName, String entityId) async {
+    try {
+      final db = await _db.database;
+      
+      // Check if table has sync_status column
+      final tableInfo = await db.rawQuery('PRAGMA table_info($tableName)');
+      final hasSyncStatus = tableInfo.any((col) => col['name'] == 'sync_status');
+      
+      if (hasSyncStatus) {
+        await db.update(
+          tableName,
+          {
+            'sync_status': 'synced',
+            'sync_error': null,
+          },
+          where: 'id = ?',
+          whereArgs: [entityId],
+        );
+        debugPrint('[OUTBOX_SYNC] Marked local row synced: table=$tableName, id=$entityId');
+      }
+    } catch (e) {
+      debugPrint('⚠️ Failed to mark local row as synced: $e');
+      // Don't rethrow - this is a local metadata update, not critical
     }
   }
 

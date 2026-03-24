@@ -1,13 +1,18 @@
 import 'package:flutter/foundation.dart';
+import 'package:sqflite/sqflite.dart' as Sqflite;
 import 'package:flowtill/models/order.dart';
 import 'package:flowtill/models/order_item.dart';
 import 'package:flowtill/models/product.dart';
 import 'package:flowtill/models/split_bill.dart';
 import 'package:flowtill/models/selected_modifier.dart';
 import 'package:flowtill/models/loyalty_models.dart';
+import 'package:flowtill/database/app_database.dart';
 import 'package:flowtill/services/order_repository_hybrid.dart';
+import 'package:flowtill/services/order_repository_offline.dart';
 import 'package:flowtill/services/transaction_repository_hybrid.dart';
 import 'package:flowtill/services/inventory_repository.dart';
+import 'package:flowtill/services/connection_service.dart';
+import 'package:flowtill/services/sync_service.dart';
 import 'package:flowtill/services/promotion_service.dart';
 import 'package:flowtill/services/promotion_engine.dart';
 import 'package:flowtill/services/packaged_deal_service.dart';
@@ -28,6 +33,7 @@ class OrderProvider with ChangeNotifier {
   final _orderRepository = OrderRepositoryHybrid();
   final _transactionRepository = TransactionRepositoryHybrid();
   final _inventoryRepository = InventoryRepository();
+  final _connectionService = ConnectionService();
   final _promotionService = PromotionService();
   late final _promotionEngine = PromotionEngine(_promotionService);
   PackagedDealService? _packagedDealService;
@@ -903,10 +909,11 @@ class OrderProvider with ChangeNotifier {
     notifyListeners();
   }
 
-  /// Save completed order to Supabase (orders + order_items + transactions)
+  /// Save completed order (orders + order_items + transactions)
+  /// Platform-aware: Device builds use offline-first, web uses direct Supabase
   /// Table associations are kept for history, but status='completed' frees the table
   /// Also decrements inventory for products with track_stock enabled
-  Future<bool> saveCompletedOrderToSupabase({
+  Future<bool> saveCompletedOrder({
     String? splitPaymentSummary,
     Map<String, double>? splitPayments,
   }) async {
@@ -915,7 +922,28 @@ class OrderProvider with ChangeNotifier {
       return false;
     }
 
+    debugPrint('[PAYMENT_FLOW] Platform = ${kIsWeb ? "web" : "device"}');
+
+    if (kIsWeb) {
+      return _saveCompletedOrderWeb(
+        splitPaymentSummary: splitPaymentSummary,
+        splitPayments: splitPayments,
+      );
+    } else {
+      return _saveCompletedOrderOfflineFirst(
+        splitPaymentSummary: splitPaymentSummary,
+        splitPayments: splitPayments,
+      );
+    }
+  }
+
+  /// WEB: Save directly to Supabase (no offline queue)
+  Future<bool> _saveCompletedOrderWeb({
+    String? splitPaymentSummary,
+    Map<String, double>? splitPayments,
+  }) async {
     try {
+      debugPrint('[PAYMENT_FLOW] Saving directly to Supabase (web path)');
       debugPrint('💾 Saving completed order to Supabase: ${_currentOrder!.id}');
 
       // Convert in-memory Order to Supabase models with status='completed'
@@ -927,7 +955,6 @@ class OrderProvider with ChangeNotifier {
         completedAt: _currentOrder!.completedAt,
         paymentMethod: _currentOrder!.paymentMethod,
         changeDue: _currentOrder!.changeDue,
-        // Keep tableId and tableNumber for historical records
       );
 
       // 1. Save order + items (upsert if exists, insert if new)
@@ -955,7 +982,7 @@ class OrderProvider with ChangeNotifier {
             order: completedOrder,
             paymentMethod: paymentMethod,
             amountPaid: amount,
-            changeGiven: 0.0, // Change is handled per-split, not per-transaction
+            changeGiven: 0.0,
             meta: {
               'split_bill': true,
               'split_summary': splitPaymentSummary,
@@ -987,7 +1014,144 @@ class OrderProvider with ChangeNotifier {
         }
       }
 
-      // 3. Decrement inventory based on BackOffice inventory mode
+      return await _processInventoryDeduction();
+    } catch (e, stackTrace) {
+      debugPrint('❌ Error saving order to Supabase: $e');
+      debugPrint('Stack: $stackTrace');
+      return false;
+    }
+  }
+
+  /// DEVICE: Save locally first, then trigger sync
+  Future<bool> _saveCompletedOrderOfflineFirst({
+    String? splitPaymentSummary,
+    Map<String, double>? splitPayments,
+  }) async {
+    try {
+      debugPrint('[PAYMENT_FLOW] Completing in-memory order');
+      debugPrint('💾 Saving completed order offline-first: ${_currentOrder!.id}');
+
+      // Convert in-memory Order to Supabase models with status='completed'
+      final (eposOrder, eposItems) = _orderRepository.convertToEposModels(_currentOrder!);
+      
+      // Ensure status is 'completed' and keep table associations for history
+      final completedOrder = eposOrder.copyWith(
+        status: 'completed',
+        completedAt: _currentOrder!.completedAt,
+        paymentMethod: _currentOrder!.paymentMethod,
+        changeDue: _currentOrder!.changeDue,
+      );
+
+      // 1. Save order locally
+      debugPrint('[PAYMENT_FLOW] Saving order locally');
+      final orderSaved = await _orderRepository.convertToEposModels(_currentOrder!);
+      final offlineRepo = OrderRepositoryOffline();
+      final localOrderSaved = await offlineRepo.upsertOrderWithItems(
+        completedOrder, 
+        eposItems,
+        queueForSync: true,
+      );
+      
+      if (!localOrderSaved) {
+        debugPrint('[PAYMENT_FLOW] ❌ Failed to save order locally');
+        return false;
+      }
+      debugPrint('[PAYMENT_FLOW] ✅ Order saved locally');
+
+      // 2. Save order items locally
+      debugPrint('[PAYMENT_FLOW] Saving order items locally');
+      final itemsSaved = await offlineRepo.saveOrderItemsLocally(eposItems);
+      if (!itemsSaved) {
+        debugPrint('[PAYMENT_FLOW] ❌ Failed to save order items locally');
+        return false;
+      }
+      debugPrint('[PAYMENT_FLOW] ✅ Order items saved locally (${eposItems.length} items)');
+
+      // 3. Save transaction(s) locally
+      debugPrint('[PAYMENT_FLOW] Saving transaction locally');
+      if (splitPayments != null && splitPayments.isNotEmpty) {
+        // Split bill: Create separate transactions for each payment method
+        debugPrint('[PAYMENT_FLOW] Recording split bill transactions:');
+        debugPrint('   Split summary: $splitPaymentSummary');
+        
+        bool allTransactionsSucceeded = true;
+        
+        for (final entry in splitPayments.entries) {
+          final paymentMethod = entry.key;
+          final amount = entry.value;
+          
+          debugPrint('   Recording $paymentMethod transaction: £${amount.toStringAsFixed(2)}');
+          
+          final transaction = await _transactionRepository.saveTransactionLocally(
+            order: completedOrder,
+            paymentMethod: paymentMethod,
+            amountPaid: amount,
+            changeGiven: 0.0,
+            meta: {
+              'split_bill': true,
+              'split_summary': splitPaymentSummary,
+            },
+          );
+
+          if (transaction == null) {
+            debugPrint('⚠️ Failed to record $paymentMethod transaction');
+            allTransactionsSucceeded = false;
+          }
+        }
+        
+        if (!allTransactionsSucceeded) {
+          debugPrint('[PAYMENT_FLOW] ⚠️ Order saved but some split bill transactions failed');
+          return false;
+        }
+      } else {
+        // Single payment method: Create one transaction
+        final transaction = await _transactionRepository.saveTransactionLocally(
+          order: completedOrder,
+          paymentMethod: _currentOrder!.paymentMethod ?? 'Unknown',
+          amountPaid: _currentOrder!.amountPaid,
+          changeGiven: _currentOrder!.changeDue,
+        );
+
+        if (transaction == null) {
+          debugPrint('[PAYMENT_FLOW] ⚠️ Order saved but transaction recording failed');
+          return false;
+        }
+      }
+      debugPrint('[PAYMENT_FLOW] ✅ Transaction(s) saved locally');
+
+      debugPrint('[PAYMENT_FLOW] Local checkout save complete');
+
+      // 4. Verify local save with counts
+      await _verifyLocalCheckoutSave(completedOrder.id, eposItems.length);
+
+      // 5. Process inventory deduction
+      final inventorySuccess = await _processInventoryDeduction();
+      if (!inventorySuccess) {
+        debugPrint('[PAYMENT_FLOW] ⚠️ Inventory deduction failed');
+      }
+
+      // 6. Trigger sync if online
+      if (_connectionService.isOnline) {
+        debugPrint('[PAYMENT_FLOW] Triggering sync (device is online)');
+        // Trigger sync in background - don't wait for it
+        _triggerBackgroundSync();
+      } else {
+        debugPrint('[PAYMENT_FLOW] Device is offline - sync will happen when online');
+      }
+
+      debugPrint('[PAYMENT_FLOW] ✅ Offline-first checkout complete');
+      return true;
+    } catch (e, stackTrace) {
+      debugPrint('[PAYMENT_FLOW] ❌ Error in offline-first checkout: $e');
+      debugPrint('Stack: $stackTrace');
+      return false;
+    }
+  }
+
+  /// Process inventory deduction (common for both paths)
+  Future<bool> _processInventoryDeduction() async {
+    try {
+
       debugPrint('📦 Processing inventory deduction for order items...');
       debugPrint('   Total items in order: ${_currentOrder!.items.length}');
       
@@ -1027,16 +1191,78 @@ class OrderProvider with ChangeNotifier {
         }
       }
 
-      debugPrint('✅ Order, transaction, and inventory updated successfully');
-      debugPrint('   Status: completed');
+      debugPrint('✅ Inventory updated successfully');
       if (_currentOrder!.tableNumber != null) {
         debugPrint('   Table ${_currentOrder!.tableNumber} is now free (status=completed)');
       }
       return true;
     } catch (e, stackTrace) {
-      debugPrint('❌ Error saving order to Supabase: $e');
+      debugPrint('❌ Error processing inventory deduction: $e');
       debugPrint('Stack: $stackTrace');
       return false;
+    }
+  }
+
+  /// Verify local checkout save with counts
+  Future<void> _verifyLocalCheckoutSave(String orderId, int expectedItemCount) async {
+    try {
+      final db = await AppDatabase.instance.database;
+      
+      // Count local orders
+      final orderCountResult = await db.rawQuery('SELECT COUNT(*) as count FROM orders WHERE id = ?', [orderId]);
+      final orderCount = orderCountResult.first['count'] as int? ?? 0;
+      
+      // Count local order_items
+      final itemCountResult = await db.rawQuery('SELECT COUNT(*) as count FROM order_items WHERE order_id = ?', [orderId]);
+      final itemCount = itemCountResult.first['count'] as int? ?? 0;
+      
+      // Count local transactions
+      final transactionCountResult = await db.rawQuery('SELECT COUNT(*) as count FROM transactions WHERE order_id = ?', [orderId]);
+      final transactionCount = transactionCountResult.first['count'] as int? ?? 0;
+      
+      // Count outbox entries (correct table name is outbox_queue)
+      final outboxCountResult = await db.rawQuery(
+        'SELECT COUNT(*) as count FROM outbox_queue WHERE entity_id = ? OR payload LIKE ?',
+        [orderId, '%"order_id":"$orderId"%']
+      );
+      final outboxCount = outboxCountResult.first['count'] as int? ?? 0;
+      
+      debugPrint('[PAYMENT_FLOW] ═══════════════════════════════════════');
+      debugPrint('[PAYMENT_FLOW] LOCAL SAVE VERIFICATION');
+      debugPrint('[PAYMENT_FLOW] ═══════════════════════════════════════');
+      debugPrint('[PAYMENT_FLOW] Order ID: $orderId');
+      debugPrint('[PAYMENT_FLOW] Local orders count: $orderCount (expected: 1)');
+      debugPrint('[PAYMENT_FLOW] Local order_items count: $itemCount (expected: $expectedItemCount)');
+      debugPrint('[PAYMENT_FLOW] Local transactions count: $transactionCount (expected: ≥1)');
+      debugPrint('[PAYMENT_FLOW] Outbox entries count: $outboxCount');
+      debugPrint('[PAYMENT_FLOW] ═══════════════════════════════════════');
+      
+      if (orderCount != 1) {
+        debugPrint('[PAYMENT_FLOW] ⚠️ WARNING: Expected 1 order, found $orderCount');
+      }
+      if (itemCount != expectedItemCount) {
+        debugPrint('[PAYMENT_FLOW] ⚠️ WARNING: Expected $expectedItemCount items, found $itemCount');
+      }
+      if (transactionCount < 1) {
+        debugPrint('[PAYMENT_FLOW] ⚠️ WARNING: Expected at least 1 transaction, found $transactionCount');
+      }
+    } catch (e) {
+      debugPrint('[PAYMENT_FLOW] ⚠️ Failed to verify local save: $e');
+    }
+  }
+
+  /// Trigger background sync (non-blocking)
+  Future<void> _triggerBackgroundSync() async {
+    try {
+      // Trigger sync in background - fire-and-forget
+      final syncService = SyncService();
+      syncService.syncAll().then((_) {
+        debugPrint('[PAYMENT_FLOW] ✅ Background sync completed');
+      }).catchError((e) {
+        debugPrint('[PAYMENT_FLOW] ⚠️ Background sync failed: $e');
+      });
+    } catch (e) {
+      debugPrint('[PAYMENT_FLOW] ⚠️ Failed to trigger background sync: $e');
     }
   }
 

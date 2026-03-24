@@ -775,8 +775,8 @@ class _SplitBillScreenState extends State<SplitBillScreen> {
       changeDue: totalChange,
     );
 
-    // Save to database (this will create the order and primary transaction)
-    final saved = await orderProvider.saveCompletedOrderToSupabase(
+    // Save to database (platform-aware: offline-first for device, direct Supabase for web)
+    final saved = await orderProvider.saveCompletedOrder(
       splitPaymentSummary: splitSummary,
       splitPayments: {
         if (cardTotal > 0) 'card': cardTotal,

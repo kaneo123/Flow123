@@ -843,6 +843,7 @@ class _CardPaymentModalState extends State<_CardPaymentModal> {
 
     try {
       // 1. Complete order in memory
+      debugPrint('[PAYMENT_FLOW] Confirm payment tapped');
       debugPrint('   Completing order...');
       widget.orderProvider.completeOrder(
         paymentMethod: 'card',
@@ -850,12 +851,11 @@ class _CardPaymentModalState extends State<_CardPaymentModal> {
       );
       debugPrint('   Order completed successfully');
 
-      // 2. Save to Supabase
-      debugPrint('   Saving to Supabase...');
-      final saved = await widget.orderProvider.saveCompletedOrderToSupabase();
+      // 2. Save order (platform-aware: offline-first for device, direct Supabase for web)
+      final saved = await widget.orderProvider.saveCompletedOrder();
       
       if (!saved) {
-        debugPrint('⚠️ Failed to save to Supabase, but continuing...');
+        debugPrint('⚠️ Failed to save order, but continuing...');
         if (context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -865,7 +865,7 @@ class _CardPaymentModalState extends State<_CardPaymentModal> {
           );
         }
       } else {
-        debugPrint('✅ Order saved to Supabase successfully');
+        debugPrint('✅ Order saved successfully');
       }
 
       // 3. Clear order history (for table orders)
@@ -1239,12 +1239,11 @@ class _CashPaymentModalState extends State<_CashPaymentModal> {
         // Don't block payment completion if drawer fails
       }
 
-      // 2. Save to Supabase
-      debugPrint('   Saving to Supabase...');
-      final saved = await widget.orderProvider.saveCompletedOrderToSupabase();
+      // 2. Save order (platform-aware: offline-first for device, direct Supabase for web)
+      final saved = await widget.orderProvider.saveCompletedOrder();
       
       if (!saved) {
-        debugPrint('⚠️ Failed to save to Supabase, but continuing...');
+        debugPrint('⚠️ Failed to save order, but continuing...');
         if (context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -1254,7 +1253,7 @@ class _CashPaymentModalState extends State<_CashPaymentModal> {
           );
         }
       } else {
-        debugPrint('✅ Order saved to Supabase successfully');
+        debugPrint('✅ Order saved successfully');
       }
 
       // 3. Clear order history (for table orders)

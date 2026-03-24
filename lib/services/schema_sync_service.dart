@@ -8,6 +8,11 @@ import 'package:crypto/crypto.dart';
 /// Schema synchronization service
 /// Ensures local SQLite database structure mirrors Supabase schema
 /// Runs on app startup to detect and apply schema changes
+/// 
+/// OFFLINE TRANSACTION SUPPORT:
+/// - Adds local-only columns to transactional tables (orders, order_items, transactions)
+/// - Creates local-only sync_queue table for offline change tracking
+/// - Preserves local-only columns during schema updates
 class SchemaSyncService {
   static final SchemaSyncService _instance = SchemaSyncService._internal();
   factory SchemaSyncService() => _instance;
@@ -40,6 +45,26 @@ class SchemaSyncService {
     'loyalty_customers',
     'loyalty_transactions',
   ];
+
+  /// Tables that require local-only offline sync columns
+  static const Set<String> _tablesWithOfflineSupport = {
+    'orders',
+    'order_items',
+    'transactions',
+  };
+
+  /// Local-only columns for offline transaction tracking
+  /// These columns do NOT exist in Supabase but are added to local mirror tables
+  /// 
+  /// IMPORTANT: Default 'pending' applies to NEW locally-created records only.
+  /// Records mirrored from Supabase are explicitly set to 'synced' by MirrorContentSyncService.
+  static const Map<String, String> _localOnlyColumns = {
+    'sync_status': 'TEXT DEFAULT "pending"',
+    'sync_error': 'TEXT',
+    'last_sync_attempt_at': 'INTEGER',
+    'sync_attempt_count': 'INTEGER DEFAULT 0',
+    'device_id': 'TEXT',
+  };
 
   /// Map Supabase (PostgreSQL) types to SQLite types
   String _mapSupabaseTypeToSQLite(String supabaseType) {
@@ -161,6 +186,14 @@ class SchemaSyncService {
           columnDefs.add('$columnName $columnType');
         }
       }
+
+      // Add local-only columns for offline-enabled tables
+      if (_tablesWithOfflineSupport.contains(tableName)) {
+        debugPrint('  📲 Adding local-only offline sync columns to $tableName');
+        for (final entry in _localOnlyColumns.entries) {
+          columnDefs.add('${entry.key} ${entry.value}');
+        }
+      }
       
       final createTableSQL = '''
         CREATE TABLE IF NOT EXISTS $tableName (
@@ -175,6 +208,94 @@ class SchemaSyncService {
       debugPrint('  ✅ Successfully created table: $tableName');
     } catch (e) {
       debugPrint('  ❌ Failed to create table $tableName: $e');
+      rethrow;
+    }
+  }
+
+  /// Add local-only offline sync columns to existing table
+  /// Used when a table exists but is missing local-only columns
+  Future<void> _ensureLocalOnlyColumns(Database db, String tableName) async {
+    if (!_tablesWithOfflineSupport.contains(tableName)) {
+      return; // Table doesn't need offline columns
+    }
+
+    try {
+      debugPrint('  🔍 Checking for local-only columns in $tableName');
+      
+      // Get current local schema
+      final result = await db.rawQuery('PRAGMA table_info($tableName)');
+      final existingColumns = result.map((row) => row['name'] as String).toSet();
+      
+      // Check which local-only columns are missing
+      final missingColumns = <String, String>{};
+      for (final entry in _localOnlyColumns.entries) {
+        if (!existingColumns.contains(entry.key)) {
+          missingColumns[entry.key] = entry.value;
+        }
+      }
+
+      if (missingColumns.isEmpty) {
+        debugPrint('  ✅ All local-only columns already exist in $tableName');
+        return;
+      }
+
+      // Add missing local-only columns
+      debugPrint('  ➕ Adding ${missingColumns.length} missing local-only columns to $tableName');
+      for (final entry in missingColumns.entries) {
+        final columnName = entry.key;
+        final columnDef = entry.value;
+        
+        try {
+          await db.execute('ALTER TABLE $tableName ADD COLUMN $columnName $columnDef');
+          debugPrint('    ✅ Added local-only column: $columnName');
+        } catch (e) {
+          debugPrint('    ⚠️ Failed to add local-only column $columnName: $e');
+        }
+      }
+      
+      debugPrint('  ✅ Local-only columns ensured for $tableName');
+    } catch (e) {
+      debugPrint('  ⚠️ Error ensuring local-only columns for $tableName: $e');
+    }
+  }
+
+  /// Create local-only sync_queue table
+  /// This table exists ONLY locally and is never synced to Supabase
+  Future<void> _ensureSyncQueueTable(Database db) async {
+    try {
+      debugPrint('🔄 Ensuring local-only sync_queue table exists');
+      
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS sync_queue (
+          id TEXT PRIMARY KEY,
+          entity_type TEXT NOT NULL,
+          entity_id TEXT NOT NULL,
+          operation TEXT NOT NULL,
+          payload TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER,
+          last_attempt_at INTEGER,
+          attempt_count INTEGER DEFAULT 0,
+          error_message TEXT,
+          priority INTEGER DEFAULT 0
+        )
+      ''');
+
+      // Create indexes for efficient queue processing
+      await db.execute('''
+        CREATE INDEX IF NOT EXISTS idx_sync_queue_status 
+        ON sync_queue(status, priority DESC, created_at ASC)
+      ''');
+
+      await db.execute('''
+        CREATE INDEX IF NOT EXISTS idx_sync_queue_entity 
+        ON sync_queue(entity_type, entity_id)
+      ''');
+
+      debugPrint('  ✅ sync_queue table ready (local-only)');
+    } catch (e) {
+      debugPrint('  ❌ Failed to create sync_queue table: $e');
       rethrow;
     }
   }
@@ -283,6 +404,8 @@ class SchemaSyncService {
         debugPrint('  🆕 Table does not exist locally, creating from scratch...');
         await _createLocalMirrorTable(db, tableName, supabaseSchema);
         
+        // Local-only columns are already added by _createLocalMirrorTable for offline-enabled tables
+        
         // Update schema snapshot after successful creation
         final newSchemaHash = _computeSchemaHash(supabaseSchema);
         await _updateSchemaSnapshot(tableName, newSchemaHash);
@@ -314,6 +437,7 @@ class SchemaSyncService {
       debugPrint('  🗑️ Dropped legacy table: $tableName');
       
       // Recreate table from current Supabase schema
+      // This automatically includes local-only columns for offline-enabled tables
       await _createLocalMirrorTable(db, tableName, supabaseSchema);
       debugPrint('  🆕 Recreated table with current schema: $tableName');
 
@@ -336,18 +460,33 @@ class SchemaSyncService {
     debugPrint('═══════════════════════════════════════════════════════════');
 
     try {
+      final db = await _db.database;
+
       // Ensure schema_snapshot table exists
       await _ensureSchemaSnapshotTable();
 
-      // Sync all tables
+      // Ensure local-only sync_queue table exists
+      await _ensureSyncQueueTable(db);
+
+      // Sync all Supabase mirror tables
       for (final tableName in _tablesToSync) {
         await _syncTableSchema(tableName);
+      }
+
+      // Ensure local-only columns exist on offline-enabled tables
+      // This handles backward compatibility for existing databases
+      debugPrint('');
+      debugPrint('🔄 Ensuring local-only offline sync columns...');
+      for (final tableName in _tablesWithOfflineSupport) {
+        await _ensureLocalOnlyColumns(db, tableName);
       }
 
       debugPrint('');
       debugPrint('═══════════════════════════════════════════════════════════');
       debugPrint('✅ SCHEMA SYNC COMPLETED');
-      debugPrint('   Synced ${_tablesToSync.length} tables');
+      debugPrint('   Synced ${_tablesToSync.length} Supabase mirror tables');
+      debugPrint('   Ensured local-only columns for ${_tablesWithOfflineSupport.length} offline-enabled tables');
+      debugPrint('   Created local-only sync_queue table');
       debugPrint('═══════════════════════════════════════════════════════════');
       debugPrint('');
     } catch (e, stackTrace) {

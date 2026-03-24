@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
+import 'package:sqflite/sqflite.dart';
 import 'package:flowtill/database/app_database.dart';
 import 'package:flowtill/models/epos_order.dart';
 import 'package:flowtill/models/epos_order_item.dart';
@@ -43,33 +44,112 @@ class OrderRepositoryOffline {
   }
 
   /// Save order to local DB and queue for sync
+  /// 
+  /// CRITICAL: This is for LOCALLY-CREATED orders only.
+  /// Mirrored cloud-origin orders should use MirrorContentSyncService.importMirroredRow()
   Future<bool> upsertOrderWithItems(
     EposOrder order,
     List<EposOrderItem> items, {
     bool queueForSync = true,
   }) async {
     try {
-      // Convert to local Order model for storage
-      final localOrder = {
+      final db = await _db.database;
+      
+      // Get actual local table columns to ensure proper mapping
+      final tableInfo = await db.rawQuery('PRAGMA table_info(orders)');
+      final columnNames = tableInfo.map((col) => col['name'] as String).toSet();
+      
+      // Check if orders table has sync_status column (new offline sync system)
+      final hasSyncStatus = columnNames.contains('sync_status');
+      
+      // PROTECTION: Check if row already exists with sync_status='synced'
+      // If so, refuse to downgrade it to pending (prevents mirrored rows from being corrupted)
+      if (hasSyncStatus) {
+        final existing = await db.query(
+          'orders',
+          where: 'id = ?',
+          whereArgs: [order.id],
+          limit: 1,
+        );
+        
+        if (existing.isNotEmpty) {
+          final existingSyncStatus = existing.first['sync_status'] as String?;
+          if (existingSyncStatus == 'synced') {
+            debugPrint('[ORDER_REPO] ⚠️ PROTECTION: Refusing to overwrite synced order ${order.id} with local save');
+            debugPrint('[ORDER_REPO]    This order came from cloud and should not be downgraded to pending');
+            debugPrint('[ORDER_REPO]    If this is a legitimate local modification, update the existing row carefully');
+            return false;
+          }
+        }
+      }
+      
+      // Build order data map using ONLY columns that exist in the local schema
+      // This prevents mismatched field name errors
+      final localOrder = <String, dynamic>{
         'id': order.id,
-        'outlet_id': order.outletId,
-        'table_id': order.tableId,
-        'staff_id': order.staffId,
-        'status': order.status,
-        'order_type': order.orderType,
-        'items': jsonEncode(items.map((i) => i.toJson()).toList()),
-        'subtotal': order.subtotal,
-        'tax_total': order.taxAmount,
-        'discount_total': order.discountAmount,
-        'total': order.totalDue,
-        'notes': order.notes,
-        'created_at': order.openedAt.millisecondsSinceEpoch,
-        'updated_at': DateTime.now().millisecondsSinceEpoch,
-        'synced_at': null,
       };
+      
+      // Map fields only if they exist in the actual schema
+      if (columnNames.contains('outlet_id')) localOrder['outlet_id'] = order.outletId;
+      if (columnNames.contains('table_id')) localOrder['table_id'] = order.tableId;
+      if (columnNames.contains('staff_id')) localOrder['staff_id'] = order.staffId;
+      if (columnNames.contains('status')) localOrder['status'] = order.status;
+      if (columnNames.contains('order_type')) localOrder['order_type'] = order.orderType;
+      if (columnNames.contains('subtotal')) localOrder['subtotal'] = order.subtotal;
+      if (columnNames.contains('notes')) localOrder['notes'] = order.notes;
+      if (columnNames.contains('created_at')) localOrder['created_at'] = order.openedAt.millisecondsSinceEpoch;
+      if (columnNames.contains('updated_at')) localOrder['updated_at'] = DateTime.now().millisecondsSinceEpoch;
+      
+      // Handle items - stored as JSON in orders table if column exists
+      // NOTE: Most schemas store items in separate order_items table, not in orders.items
+      if (columnNames.contains('items')) {
+        localOrder['items'] = jsonEncode(items.map((i) => i.toJson()).toList());
+      }
+      
+      // Tax, discount, total fields - use actual Supabase column names (snake_case)
+      if (columnNames.contains('tax_amount')) localOrder['tax_amount'] = order.taxAmount;
+      if (columnNames.contains('discount_amount')) localOrder['discount_amount'] = order.discountAmount;
+      if (columnNames.contains('total_due')) localOrder['total_due'] = order.totalDue;
+      if (columnNames.contains('service_charge')) localOrder['service_charge'] = order.serviceCharge;
+      if (columnNames.contains('voucher_amount')) localOrder['voucher_amount'] = order.voucherAmount;
+      if (columnNames.contains('loyalty_redeemed')) localOrder['loyalty_redeemed'] = order.loyaltyRedeemed;
+      if (columnNames.contains('total_paid')) localOrder['total_paid'] = order.totalPaid;
+      if (columnNames.contains('change_due')) localOrder['change_due'] = order.changeDue;
+      if (columnNames.contains('payment_method')) localOrder['payment_method'] = order.paymentMethod;
+      
+      // CRITICAL: Mark locally-created orders as 'pending' for upload
+      // This is a NEW local order, not a mirrored cloud-origin row
+      if (hasSyncStatus) {
+        localOrder['sync_status'] = 'pending';
+        localOrder['sync_error'] = null;
+        localOrder['last_sync_attempt_at'] = null;
+        localOrder['sync_attempt_count'] = 0;
+        
+        // Set device_id if available (could be enhanced to use actual device ID)
+        if (columnNames.contains('device_id')) {
+          localOrder['device_id'] = null; // TODO: Set to actual device ID
+        }
+        
+        debugPrint('[ORDER_REPO] 💾 Saving LOCAL order with sync_status=pending: ${order.id}');
+        debugPrint('[ORDER_REPO]    This order will be queued for upload to Supabase');
+      }
 
-      // Save to local DB
-      await _db.insertOrder(localOrder);
+      // SAFE UPSERT: Try update first, then insert if not exists
+      // This prevents ConflictAlgorithm.replace from deleting and recreating the row
+      final updateCount = await db.update(
+        'orders',
+        localOrder,
+        where: 'id = ?',
+        whereArgs: [order.id],
+      );
+      
+      if (updateCount == 0) {
+        // Row doesn't exist, insert it
+        await db.insert('orders', localOrder);
+        debugPrint('[ORDER_REPO]    ✅ Inserted new local order: ${order.id}');
+      } else {
+        debugPrint('[ORDER_REPO]    ✅ Updated existing local order: ${order.id}');
+      }
 
       // Add to outbox queue for sync
       if (queueForSync) {
@@ -82,10 +162,14 @@ class OrderRepositoryOffline {
           operation: 'insert',
           payload: orderJson,
         );
+        
+        debugPrint('[ORDER_REPO]    ✅ Queued for upload via outbox');
       }
 
       return true;
     } catch (e, stackTrace) {
+      debugPrint('[ORDER_REPO] ❌ Failed to save order: $e');
+      debugPrint('Stack: $stackTrace');
       return false;
     }
   }
@@ -304,6 +388,89 @@ class OrderRepositoryOffline {
     }
   }
 
+  /// Save order items locally with sync_status='pending'
+  /// For locally-created order items that need to be synced to Supabase
+  Future<bool> saveOrderItemsLocally(List<EposOrderItem> items) async {
+    if (items.isEmpty) return true;
+    
+    try {
+      final db = await _db.database;
+      
+      // Get actual local table columns
+      final tableInfo = await db.rawQuery('PRAGMA table_info(order_items)');
+      final columnNames = tableInfo.map((col) => col['name'] as String).toSet();
+      final hasSyncStatus = columnNames.contains('sync_status');
+      
+      debugPrint('[ORDER_REPO_OFFLINE] 💾 Saving ${items.length} order items locally');
+      
+      for (final item in items) {
+        // Build item data map using only columns that exist
+        final localItem = <String, dynamic>{
+          'id': item.id,
+        };
+        
+        if (columnNames.contains('order_id')) localItem['order_id'] = item.orderId;
+        if (columnNames.contains('product_id')) localItem['product_id'] = item.productId;
+        if (columnNames.contains('product_name')) localItem['product_name'] = item.productName;
+        if (columnNames.contains('quantity')) localItem['quantity'] = item.quantity;
+        if (columnNames.contains('unit_price')) localItem['unit_price'] = item.unitPrice;
+        if (columnNames.contains('gross_line_total')) localItem['gross_line_total'] = item.grossLineTotal;
+        if (columnNames.contains('net_line_total')) localItem['net_line_total'] = item.netLineTotal;
+        if (columnNames.contains('discount_amount')) localItem['discount_amount'] = item.discountAmount;
+        if (columnNames.contains('tax_rate')) localItem['tax_rate'] = item.taxRate;
+        if (columnNames.contains('tax_amount')) localItem['tax_amount'] = item.taxAmount;
+        if (columnNames.contains('notes')) localItem['notes'] = item.notes;
+        if (columnNames.contains('plu')) localItem['plu'] = item.plu;
+        if (columnNames.contains('course')) localItem['course'] = item.course;
+        if (columnNames.contains('sort_order')) localItem['sort_order'] = item.sortOrder;
+        if (columnNames.contains('modifiers') && item.modifiers.isNotEmpty) {
+          localItem['modifiers'] = jsonEncode(item.modifiers.map((m) => m.toJson()).toList());
+        }
+        if (columnNames.contains('created_at')) localItem['created_at'] = DateTime.now().millisecondsSinceEpoch;
+        
+        // Mark as pending for local-origin items
+        if (hasSyncStatus) {
+          localItem['sync_status'] = 'pending';
+          localItem['sync_error'] = null;
+          localItem['last_sync_attempt_at'] = null;
+          localItem['sync_attempt_count'] = 0;
+        }
+        
+        // Safe upsert
+        final updateCount = await db.update(
+          'order_items',
+          localItem,
+          where: 'id = ?',
+          whereArgs: [item.id],
+        );
+        
+        if (updateCount == 0) {
+          await db.insert('order_items', localItem);
+          debugPrint('[ORDER_REPO_OFFLINE]    ✅ Inserted item ${item.id} (${item.productName}) - sync_status=pending');
+        } else {
+          debugPrint('[ORDER_REPO_OFFLINE]    ✅ Updated item ${item.id} (${item.productName}) - sync_status=pending');
+        }
+      }
+      
+      // Add to outbox for sync
+      for (final item in items) {
+        await _db.addToOutbox(
+          entityType: 'order_item',
+          entityId: item.id,
+          operation: 'insert',
+          payload: item.toJson(),
+        );
+      }
+      
+      debugPrint('[ORDER_REPO_OFFLINE] ✅ All order items saved and queued for sync');
+      return true;
+    } catch (e, stackTrace) {
+      debugPrint('[ORDER_REPO_OFFLINE] ❌ Failed to save order items: $e');
+      debugPrint('Stack: $stackTrace');
+      return false;
+    }
+  }
+
   /// Create order header for table
   Future<EposOrder?> createOrderHeaderForTable({
     required String outletId,
@@ -323,15 +490,32 @@ class OrderRepositoryOffline {
   }
 
   /// Convert local Order to EposOrder
+  /// Uses actual Supabase column names (snake_case) for reading
   EposOrder _localOrderToEposOrder(Map<String, dynamic> localOrder) {
-    // Decode items to calculate totals
-    final itemsJson = jsonDecode(localOrder['items'] as String) as List<dynamic>;
-    final items = itemsJson.map((json) => EposOrderItem.fromJson(json as Map<String, dynamic>)).toList();
+    // Decode items if stored in orders table (some schemas store items separately)
+    List<EposOrderItem> items = [];
+    if (localOrder.containsKey('items') && localOrder['items'] != null) {
+      try {
+        final itemsJson = jsonDecode(localOrder['items'] as String) as List<dynamic>;
+        items = itemsJson.map((json) => EposOrderItem.fromJson(json as Map<String, dynamic>)).toList();
+      } catch (e) {
+        debugPrint('[ORDER_REPO] ⚠️ Failed to decode items: $e');
+      }
+    }
     
+    // Use actual Supabase column names (snake_case) with fallbacks
     final subtotal = (localOrder['subtotal'] as num?)?.toDouble() ?? 0.0;
-    final taxAmount = (localOrder['tax_total'] as num?)?.toDouble() ?? 0.0;
-    final discountAmount = (localOrder['discount_total'] as num?)?.toDouble() ?? 0.0;
-    final total = (localOrder['total'] as num?)?.toDouble() ?? 0.0;
+    final taxAmount = (localOrder['tax_amount'] as num?)?.toDouble() ?? 
+                      (localOrder['tax_total'] as num?)?.toDouble() ?? 0.0;
+    final discountAmount = (localOrder['discount_amount'] as num?)?.toDouble() ?? 
+                           (localOrder['discount_total'] as num?)?.toDouble() ?? 0.0;
+    final totalDue = (localOrder['total_due'] as num?)?.toDouble() ?? 
+                     (localOrder['total'] as num?)?.toDouble() ?? 0.0;
+    final serviceCharge = (localOrder['service_charge'] as num?)?.toDouble() ?? 0.0;
+    final voucherAmount = (localOrder['voucher_amount'] as num?)?.toDouble() ?? 0.0;
+    final loyaltyRedeemed = (localOrder['loyalty_redeemed'] as num?)?.toDouble() ?? 0.0;
+    final totalPaid = (localOrder['total_paid'] as num?)?.toDouble() ?? 0.0;
+    final changeDue = (localOrder['change_due'] as num?)?.toDouble() ?? 0.0;
 
     return EposOrder(
       id: localOrder['id'] as String,
@@ -343,14 +527,14 @@ class OrderRepositoryOffline {
       tableNumber: (localOrder['table_id'] as String?)?.split('-').last,
       subtotal: subtotal,
       taxAmount: taxAmount,
-      serviceCharge: 0.0,
+      serviceCharge: serviceCharge,
       discountAmount: discountAmount,
-      voucherAmount: 0.0,
-      loyaltyRedeemed: 0.0,
-      totalDue: total,
-      totalPaid: 0.0,
-      changeDue: 0.0,
-      paymentMethod: null,
+      voucherAmount: voucherAmount,
+      loyaltyRedeemed: loyaltyRedeemed,
+      totalDue: totalDue,
+      totalPaid: totalPaid,
+      changeDue: changeDue,
+      paymentMethod: localOrder['payment_method'] as String?,
       openedAt: DateTime.fromMillisecondsSinceEpoch(localOrder['created_at'] as int),
       completedAt: null,
       updatedAt: DateTime.fromMillisecondsSinceEpoch(localOrder['updated_at'] as int),
