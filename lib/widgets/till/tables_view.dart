@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
@@ -155,12 +156,16 @@ class _TablesViewState extends State<TablesView> with SingleTickerProviderStateM
     }
 
     final startedAt = DateTime.now();
-    debugPrint('$_logPrefix Refreshing open orders for outlet $outletId');
+    debugPrint('$_logPrefix Refreshing open orders for outlet $outletId (platform: ${kIsWeb ? "web" : "device"})');
+
+    // Device builds: include offline-first pending orders
+    // Web builds: online-only
+    final includeOffline = !kIsWeb;
 
     final openOrders = await _orderRepository
-        .getOpenOrdersForOutlet(outletId, includeOffline: false)
+        .getOpenOrdersForOutlet(outletId, includeOffline: includeOffline)
         .timeout(const Duration(seconds: 6), onTimeout: () {
-      debugPrint('⌛ TablesView: open orders fetch timed out (online-only), keeping existing badges');
+      debugPrint('⌛ TablesView: open orders fetch timed out, keeping existing badges');
       return _openOrdersByTable.values.toList();
     });
 
@@ -245,6 +250,7 @@ class _TablesViewState extends State<TablesView> with SingleTickerProviderStateM
     debugPrint(
       '$_logPrefix ▶️ Handling tap for table ${table.tableNumber} (id: ${table.id}), cachedOpenOrder: ${_openOrdersByTable.containsKey(table.id)}',
     );
+    debugPrint('[TABLE_FLOW] Selected table_id=${table.id}, table_number=${table.tableNumber}');
 
     setState(() => _isProcessingTable = true);
 
@@ -393,6 +399,7 @@ class _TablesViewState extends State<TablesView> with SingleTickerProviderStateM
       } else {
         // Create new table order in Supabase
         debugPrint('$_logPrefix Creating new order for table ${table.id} (tableNumber: ${table.displayName}, staff: ${staffId ?? 'none'})');
+        debugPrint('[TABLE_FLOW] Creating order with table_id=${table.id}, table_number=${table.tableNumber}');
         EposOrder? newOrder;
         try {
           newOrder = await _orderRepository.createOrderHeaderForTable(

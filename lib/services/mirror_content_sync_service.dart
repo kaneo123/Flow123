@@ -284,6 +284,9 @@ class MirrorContentSyncService {
   /// Safe upsert: Update existing row, insert if not exists
   /// Returns true if inserted, false if updated
   /// This prevents REPLACE from deleting and recreating rows
+  /// 
+  /// PROTECTION: If existing row has sync_status='pending', skip update to avoid
+  /// overwriting locally-created unsynced data with cloud-origin mirrored data
   Future<bool> _safeUpsert(
     Database db,
     String tableName,
@@ -296,7 +299,27 @@ class MirrorContentSyncService {
       return true;
     }
     
-    // Try update first
+    // PROTECTION: Check if existing row has sync_status='pending'
+    // If so, refuse to overwrite it with mirrored cloud data
+    final existing = await db.query(
+      tableName,
+      where: 'id = ?',
+      whereArgs: [rowId],
+      limit: 1,
+    );
+    
+    if (existing.isNotEmpty) {
+      final existingRow = existing.first;
+      final existingSyncStatus = existingRow['sync_status'] as String?;
+      
+      if (existingSyncStatus == 'pending' || existingSyncStatus == 'failed') {
+        debugPrint('[MIRROR_SYNC] ⚠️ PROTECTION: Skipping mirror update for $tableName.$rowId (local sync_status=$existingSyncStatus)');
+        debugPrint('[MIRROR_SYNC]    This row was created/modified locally and has not yet synced to cloud');
+        return false; // Treat as updated (don't insert duplicate)
+      }
+    }
+    
+    // Try update
     final updateCount = await db.update(
       tableName,
       data,

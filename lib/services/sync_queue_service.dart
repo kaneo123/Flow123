@@ -27,6 +27,9 @@ class SyncQueueService {
   static const String statusCompleted = 'completed';
 
   /// Enqueue a change for later sync
+  /// DEDUPLICATION: If a pending/processing item already exists for this entity,
+  /// update its payload with latest state instead of creating a duplicate
+  /// SMART OPERATION SEMANTICS: Use 'upsert' for cleaner queue management
   Future<void> enqueue({
     required String entityType,
     required String entityId,
@@ -38,11 +41,54 @@ class SyncQueueService {
       final db = await _db.database;
       final now = DateTime.now().millisecondsSinceEpoch;
 
+      // IMPROVED DEDUPE: Check for ANY pending/processing item for this entity
+      // regardless of operation type (INSERT/UPDATE/UPSERT are semantically similar)
+      // This prevents queue noise from repeated lifecycle edits (create -> park -> resume -> complete)
+      final existing = await db.query(
+        'sync_queue',
+        where: 'entity_type = ? AND entity_id = ? AND status IN (?, ?)',
+        whereArgs: [entityType, entityId, statusPending, statusProcessing],
+        limit: 1,
+      );
+
+      if (existing.isNotEmpty) {
+        // Reuse existing queue entry with latest payload
+        final existingId = existing.first['id'] as int;
+        final existingOp = existing.first['operation'] as String;
+        
+        // Normalize operation to 'upsert' for cleaner semantics
+        // First-time create = INSERT, later edits = UPDATE, but cloud uses UPSERT for both
+        final normalizedOp = operation == operationInsert || operation == operationUpdate ? 'upsert' : operation;
+        
+        await db.update(
+          'sync_queue',
+          {
+            'operation': normalizedOp,
+            'payload': payload != null ? jsonEncode(payload) : null,
+            'updated_at': now,
+            'priority': priority,
+          },
+          where: 'id = ?',
+          whereArgs: [existingId],
+        );
+        
+        debugPrint('[OUTBOX_SYNC] 🔄 Reusing existing queue entry #$existingId for $entityType/$entityId');
+        debugPrint('[OUTBOX_SYNC]    Replaced payload with latest state');
+        if (existingOp != normalizedOp) {
+          debugPrint('[OUTBOX_SYNC]    Operation normalized: $existingOp -> $normalizedOp');
+        }
+        return;
+      }
+
+      // No existing item - create new queue entry
+      // Normalize operation for consistency
+      final normalizedOp = operation == operationInsert || operation == operationUpdate ? 'upsert' : operation;
+      
       final queueItem = {
         'id': _uuid.v4(),
         'entity_type': entityType,
         'entity_id': entityId,
-        'operation': operation,
+        'operation': normalizedOp,
         'payload': payload != null ? jsonEncode(payload) : null,
         'status': statusPending,
         'created_at': now,
@@ -54,7 +100,7 @@ class SyncQueueService {
       };
 
       await db.insert('sync_queue', queueItem);
-      debugPrint('📤 Enqueued: $operation $entityType/$entityId (priority: $priority)');
+      debugPrint('[OUTBOX_SYNC] 📤 Enqueued new: $normalizedOp $entityType/$entityId (priority: $priority)');
     } catch (e) {
       debugPrint('❌ Failed to enqueue sync item: $e');
       rethrow;
@@ -343,6 +389,24 @@ class SyncQueueService {
       debugPrint('🗑️ Deleted queue items for $entityType/$entityId');
     } catch (e) {
       debugPrint('❌ Failed to delete queue items: $e');
+    }
+  }
+  
+  /// Get count of pending outbox items for a specific entity
+  /// Useful for debugging duplicate queue entries
+  Future<int> getPendingCountForEntity(String entityType, String entityId) async {
+    try {
+      final db = await _db.database;
+      final result = await db.rawQuery(
+        'SELECT COUNT(*) as count FROM sync_queue WHERE entity_type = ? AND entity_id = ? AND status IN (?, ?)',
+        [entityType, entityId, statusPending, statusProcessing],
+      );
+      
+      final count = result.first['count'] as int? ?? 0;
+      return count;
+    } catch (e) {
+      debugPrint('❌ Failed to get pending count: $e');
+      return 0;
     }
   }
 }

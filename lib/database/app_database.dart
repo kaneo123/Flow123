@@ -780,6 +780,8 @@ class AppDatabase {
   }
 
   // Outbox queue operations (for offline sync)
+  /// DEDUPLICATION: If a pending item already exists for this entity+operation,
+  /// update its payload instead of creating a duplicate
   Future<int> addToOutbox({
     required String operation,
     required String entityType,
@@ -787,14 +789,47 @@ class AppDatabase {
     required Map<String, dynamic> payload,
   }) async {
     final db = await database;
-    return await db.insert('outbox_queue', {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    
+    // Check for existing outbox items for this entity+operation
+    final existing = await db.query(
+      'outbox_queue',
+      where: 'entity_type = ? AND entity_id = ? AND operation = ?',
+      whereArgs: [entityType, entityId, operation],
+      limit: 1,
+    );
+    
+    if (existing.isNotEmpty) {
+      // Update existing outbox item instead of creating duplicate
+      final existingId = existing.first['id'] as int;
+      
+      await db.update(
+        'outbox_queue',
+        {
+          'payload': jsonEncode(payload),
+          'created_at': now,
+        },
+        where: 'id = ?',
+        whereArgs: [existingId],
+      );
+      
+      debugPrint('[OUTBOX_SYNC] 🔄 Updated existing outbox item #$existingId: $operation $entityType/$entityId');
+      debugPrint('[OUTBOX_SYNC]    Prevented duplicate outbox row');
+      return existingId;
+    }
+    
+    // No existing item - create new
+    final id = await db.insert('outbox_queue', {
       'operation': operation,
       'entity_type': entityType,
       'entity_id': entityId,
       'payload': jsonEncode(payload),
-      'created_at': DateTime.now().millisecondsSinceEpoch,
+      'created_at': now,
       'retry_count': 0,
     });
+    
+    debugPrint('[OUTBOX_SYNC] 📤 Created new outbox item #$id: $operation $entityType/$entityId');
+    return id;
   }
 
   Future<List<Map<String, dynamic>>> getPendingOutboxItems({int limit = 50}) async {
@@ -811,6 +846,19 @@ class AppDatabase {
        limit: 1,
      );
      return result.isNotEmpty;
+   }
+   
+   /// Get count of pending outbox items for a specific entity
+   /// Useful for debugging duplicate queue entries
+   Future<int> getPendingOutboxCountForEntity(String entityType, String entityId) async {
+     final db = await database;
+     final result = await db.rawQuery(
+       'SELECT COUNT(*) as count FROM outbox_queue WHERE entity_type = ? AND entity_id = ?',
+       [entityType, entityId],
+     );
+     
+     final count = result.first['count'] as int? ?? 0;
+     return count;
    }
 
   Future<void> markOutboxItemProcessed(int id) async {

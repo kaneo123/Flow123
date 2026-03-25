@@ -689,15 +689,27 @@ class OrderProvider with ChangeNotifier {
     }
   }
 
-  /// Park current order and persist to Supabase with status='parked'
+  /// Park current order and persist with status='parked'
+  /// Platform-aware: Device builds use offline-first, web uses direct Supabase
   Future<bool> parkCurrentOrderToSupabase() async {
     if (_currentOrder == null || _currentOrder!.items.isEmpty) {
-      debugPrint('⚠️ Cannot park: No order or empty order');
+      debugPrint('[PARK_ORDER] ⚠️ Cannot park: No order or empty order');
       return false;
     }
 
+    debugPrint('[PARK_ORDER] Platform = ${kIsWeb ? "web" : "device"}');
+
+    if (kIsWeb) {
+      return _parkOrderWeb();
+    } else {
+      return _parkOrderOfflineFirst();
+    }
+  }
+
+  /// WEB: Park order directly to Supabase
+  Future<bool> _parkOrderWeb() async {
     try {
-      debugPrint('⏸️ Parking order to Supabase: ${_currentOrder!.id}');
+      debugPrint('[PARK_ORDER] ⏸️ Parking order to Supabase (web path): ${_currentOrder!.id}');
 
       // Convert in-memory Order to Supabase models
       final (eposOrder, eposItems) = _orderRepository.convertToEposModels(_currentOrder!);
@@ -711,7 +723,7 @@ class OrderProvider with ChangeNotifier {
       // Save order + items to Supabase
       final saved = await _orderRepository.upsertOrderWithItems(parkedOrder, eposItems);
       if (!saved) {
-        debugPrint('❌ Failed to park order to Supabase');
+        debugPrint('[PARK_ORDER] ❌ Failed to park order to Supabase');
         return false;
       }
 
@@ -726,43 +738,164 @@ class OrderProvider with ChangeNotifier {
       // End the session since we're parking
       await _tableLockService.endSession();
 
-      debugPrint('✅ Order parked successfully');
+      debugPrint('[PARK_ORDER] ✅ Order parked successfully');
       
-      // Note: After parking, caller should reinitialize with outlet settings
-      // For now, clear the order without any state
+      // Clear the order
       _currentOrder = null;
       _serviceChargeEnabled = false;
       notifyListeners();
       
       return true;
     } catch (e, stackTrace) {
-      debugPrint('❌ Error parking order: $e');
+      debugPrint('[PARK_ORDER] ❌ Error parking order: $e');
       debugPrint('Stack: $stackTrace');
       return false;
     }
   }
 
-  /// Resume an existing order from Supabase (for table orders)
-  Future<void> resumeOrderFromSupabase(String orderId, {String? staffId, String? staffName}) async {
-    debugPrint('🔄 OrderProvider: Resuming order $orderId');
-
+  /// DEVICE: Park order offline-first (save locally, then sync)
+  Future<bool> _parkOrderOfflineFirst() async {
     try {
-      // Fetch the EposOrder from Supabase
-      final eposOrder = await _orderRepository.getOrderById(orderId, onlineOnly: true);
-      if (eposOrder == null) {
-        debugPrint('❌ Order not found: $orderId');
-        return;
+      debugPrint('[PARK_ORDER] ════════════════════════════════════════');
+      debugPrint('[PARK_ORDER] ⏸️ Parking order offline-first (DEVICE)');
+      debugPrint('[PARK_ORDER] Order ID: ${_currentOrder!.id}');
+      debugPrint('[PARK_ORDER] Table: ${_currentOrder!.tableNumber ?? "N/A"}');
+      debugPrint('[PARK_ORDER] Items: ${_currentOrder!.items.length}');
+      debugPrint('[PARK_ORDER] Current status: ${_currentOrder!.completedAt != null ? "completed" : "open"}');
+      
+      // Additional table flow logging
+      if (_currentOrder!.tableId != null) {
+        debugPrint('[TABLE_FLOW] Parking table order:');
+        debugPrint('[TABLE_FLOW]    order_id=${_currentOrder!.id}');
+        debugPrint('[TABLE_FLOW]    table_id=${_currentOrder!.tableId}');
+        debugPrint('[TABLE_FLOW]    table_number=${_currentOrder!.tableNumber}');
+      }
+      debugPrint('[SERVICE_CHARGE] park: enabled=${_serviceChargeEnabled}, rate=${(_currentOrder!.serviceChargeRate * 100).toStringAsFixed(2)}%, subtotal=£${_currentOrder!.subtotal.toStringAsFixed(2)}, serviceCharge=£${_currentOrder!.serviceCharge.toStringAsFixed(2)}');
+
+      // Convert in-memory Order to Supabase models
+      final (eposOrder, eposItems) = _orderRepository.convertToEposModels(_currentOrder!);
+      
+      // Override status to 'parked'
+      final parkedOrder = eposOrder.copyWith(
+        status: 'parked',
+        parkedAt: DateTime.now(),
+      );
+
+      debugPrint('[PARK_ORDER] Step 1: Saving order locally');
+      debugPrint('[PARK_ORDER]    Will be marked sync_status=pending');
+      debugPrint('[PARK_ORDER]    Will be queued for outbox sync');
+      
+      // Save order + items locally first
+      final offlineRepo = OrderRepositoryOffline();
+      final localOrderSaved = await offlineRepo.upsertOrderWithItems(
+        parkedOrder, 
+        eposItems,
+        queueForSync: true,
+      );
+      
+      if (!localOrderSaved) {
+        debugPrint('[PARK_ORDER] ❌ Failed to save order locally');
+        return false;
+      }
+      debugPrint('[PARK_ORDER] ✅ Order saved locally');
+
+      debugPrint('[PARK_ORDER] Step 2: Saving order items locally (${eposItems.length} items)');
+      
+      // Save order items locally
+      final itemsSaved = await offlineRepo.saveOrderItemsLocally(eposItems);
+      if (!itemsSaved) {
+        debugPrint('[PARK_ORDER] ❌ Failed to save order items locally');
+        return false;
+      }
+      debugPrint('[PARK_ORDER] ✅ Order items saved locally');
+
+      debugPrint('[PARK_ORDER] Step 3: Activity logging');
+      
+      // Log action for table orders only (deferred on device to avoid FK violations)
+      if (_currentOrder!.tableNumber != null) {
+        await onLogAction?.call(
+          actionType: 'order_parked',
+          actionDescription: 'Order sent away (parked)',
+        );
       }
 
-      // Fetch order items
-      final eposItems = await _orderRepository.getOrderItems(orderId, onlineOnly: true);
+      debugPrint('[PARK_ORDER] Step 4: Ending table session');
+      
+      // End the session since we're parking (no-op on device builds)
+      await _tableLockService.endSession();
+
+      debugPrint('[PARK_ORDER] ✅ Order parked successfully (offline-first)');
+
+      // Trigger sync if online
+      if (_connectionService.isOnline) {
+        debugPrint('[PARK_ORDER] Step 5: Triggering background sync (device is online)');
+        _triggerBackgroundSync();
+      } else {
+        debugPrint('[PARK_ORDER] Step 5: Device is offline - sync will happen when online');
+      }
+      
+      // Clear the order
+      _currentOrder = null;
+      _serviceChargeEnabled = false;
+      notifyListeners();
+      
+      debugPrint('[PARK_ORDER] ════════════════════════════════════════');
+      return true;
+    } catch (e, stackTrace) {
+      debugPrint('[PARK_ORDER] ❌ Error parking order: $e');
+      debugPrint('Stack: $stackTrace');
+      return false;
+    }
+  }
+
+  /// Resume an existing order (for table orders)
+  /// Platform-aware: Device builds load locally first, web uses Supabase only
+  Future<void> resumeOrderFromSupabase(String orderId, {String? staffId, String? staffName}) async {
+    debugPrint('[RESUME_ORDER] ════════════════════════════════════════');
+    debugPrint('[RESUME_ORDER] 🔄 Resuming order (platform: ${kIsWeb ? "web" : "device"})');
+    debugPrint('[RESUME_ORDER] Order ID: $orderId');
+
+    try {
+      // Load order based on platform
+      final onlineOnly = kIsWeb; // Web: online-only, Device: try local first
+      
+      debugPrint('[RESUME_ORDER] Step 1: Loading order from ${onlineOnly ? "Supabase" : "local/cloud"}');
+      
+      // Fetch the EposOrder (local-first on device, Supabase-only on web)
+      final eposOrder = await _orderRepository.getOrderById(orderId, onlineOnly: onlineOnly);
+      if (eposOrder == null) {
+        debugPrint('[RESUME_ORDER] ❌ Order not found: $orderId');
+        return;
+      }
+      debugPrint('[RESUME_ORDER] ✅ Order loaded');
+      debugPrint('[RESUME_ORDER]    Status: ${eposOrder.status}');
+      debugPrint('[RESUME_ORDER]    Table ID: ${eposOrder.tableId ?? "N/A"}');
+      debugPrint('[RESUME_ORDER]    Table Number: ${eposOrder.tableNumber ?? "N/A"}');
+      
+      // Additional table flow logging
+      if (eposOrder.orderType == 'table' && eposOrder.tableId != null) {
+        debugPrint('[TABLE_FLOW] Loaded table order for resume:');
+        debugPrint('[TABLE_FLOW]    order_id=${eposOrder.id}');
+        debugPrint('[TABLE_FLOW]    table_id=${eposOrder.tableId}');
+        debugPrint('[TABLE_FLOW]    table_number=${eposOrder.tableNumber}');
+      }
+
+      debugPrint('[RESUME_ORDER] Step 2: Loading order items');
+      
+      // Fetch order items (local-first on device, Supabase-only on web)
+      final eposItems = await _orderRepository.getOrderItems(orderId, onlineOnly: onlineOnly);
+      debugPrint('[RESUME_ORDER] ✅ Items loaded: ${eposItems.length}');
 
       // Convert to in-memory Order model
       _currentOrder = Order.fromEposModels(eposOrder, eposItems);
       _serviceChargeEnabled = _currentOrder!.serviceChargeRate > 0;
       _seedPrintedQuantities(_currentOrder!, markAsSent: true);
       
+      debugPrint('[SERVICE_CHARGE] resume: enabled=${_serviceChargeEnabled}, rate=${(_currentOrder!.serviceChargeRate * 100).toStringAsFixed(2)}%, subtotal=£${_currentOrder!.subtotal.toStringAsFixed(2)}, serviceCharge=£${_currentOrder!.serviceCharge.toStringAsFixed(2)}');
+      debugPrint('[RESUME_ORDER] Step 3: Starting table session');
+      
       // Start a session for this table/tab (if staff info provided)
+      // On device builds, this is deferred to avoid FK violations
       if (staffId != null && staffName != null) {
         await _tableLockService.startSession(
           outletId: _currentOrder!.outletId,
@@ -773,10 +906,14 @@ class OrderProvider with ChangeNotifier {
         );
       }
       
+      debugPrint('[RESUME_ORDER] Step 4: Recalculating promotions');
+      
       // Recalculate promotions for resumed order
       _applyPromotions();
       
-      // Log action for table orders only
+      debugPrint('[RESUME_ORDER] Step 5: Activity logging');
+      
+      // Log action for table orders only (deferred on device to avoid FK violations)
       if (_currentOrder!.tableNumber != null) {
         await onLogAction?.call(
           actionType: 'order_resumed',
@@ -784,19 +921,22 @@ class OrderProvider with ChangeNotifier {
         );
       }
       
-      debugPrint('✅ Order resumed: ${_currentOrder!.id}');
-      debugPrint('   Type: ${eposOrder.orderType}');
-      debugPrint('   Table: ${eposOrder.tableNumber ?? "N/A"}');
-      debugPrint('   Items: ${eposItems.length}');
+      debugPrint('[RESUME_ORDER] ✅ Order resumed successfully');
+      debugPrint('[RESUME_ORDER]    Type: ${eposOrder.orderType}');
+      debugPrint('[RESUME_ORDER]    Items: ${eposItems.length}');
+      debugPrint('[RESUME_ORDER]    Total: £${_currentOrder!.totalDue.toStringAsFixed(2)}');
+      debugPrint('[RESUME_ORDER] ════════════════════════════════════════');
       
       notifyListeners();
     } catch (e, stackTrace) {
-      debugPrint('❌ Error resuming order: $e');
+      debugPrint('[RESUME_ORDER] ❌ Error resuming order: $e');
       debugPrint('Stack: $stackTrace');
     }
   }
 
-  /// Initialize a table order (use the order ID from Supabase)
+  /// Initialize a table order (use the order ID from Supabase/local)
+  /// The order header should already be created and saved by the repository
+  /// This method just loads it into memory and starts a session
   Future<void> initializeTableOrder({
     required String orderId,
     required String outletId,
@@ -807,6 +947,11 @@ class OrderProvider with ChangeNotifier {
     bool? autoEnableServiceCharge,
     double? outletServiceChargePercent,
   }) async {
+    debugPrint('[TABLE_FLOW] 🍽️ Initializing table order: $orderId');
+    debugPrint('[TABLE_FLOW]    Table ID: $tableId');
+    debugPrint('[TABLE_FLOW]    Table Number: $tableNumber');
+    debugPrint('[TABLE_FLOW]    Platform: ${kIsWeb ? "web" : "device"}');
+    
     // Auto-enable service charge if outlet has it enabled
     final shouldEnableServiceCharge = autoEnableServiceCharge ?? false;
     final serviceChargeRate = shouldEnableServiceCharge && outletServiceChargePercent != null
@@ -837,8 +982,9 @@ class OrderProvider with ChangeNotifier {
     }
     _seedPrintedQuantities(_currentOrder!);
     
-    debugPrint('🍽️ OrderProvider: Initialized table order for Table $tableNumber (Order ID: $orderId)');
-    debugPrint('   Service charge auto-enabled: $shouldEnableServiceCharge (rate: ${(serviceChargeRate * 100).toStringAsFixed(2)}%)');
+    debugPrint('[TABLE_FLOW] ✅ Table order initialized');
+    debugPrint('[TABLE_FLOW]    Service charge: $shouldEnableServiceCharge (rate: ${(serviceChargeRate * 100).toStringAsFixed(2)}%)');
+    debugPrint('[SERVICE_CHARGE] create: enabled=${_serviceChargeEnabled}, rate=${(serviceChargeRate * 100).toStringAsFixed(2)}%');
     notifyListeners();
   }
 
@@ -1028,8 +1174,22 @@ class OrderProvider with ChangeNotifier {
     Map<String, double>? splitPayments,
   }) async {
     try {
-      debugPrint('[PAYMENT_FLOW] Completing in-memory order');
-      debugPrint('💾 Saving completed order offline-first: ${_currentOrder!.id}');
+      debugPrint('[PAYMENT_FLOW] ════════════════════════════════════════');
+      debugPrint('[PAYMENT_FLOW] 💰 Completing order offline-first (DEVICE)');
+      debugPrint('[PAYMENT_FLOW] Order ID: ${_currentOrder!.id}');
+      debugPrint('[PAYMENT_FLOW] Table: ${_currentOrder!.tableNumber ?? "N/A"}');
+      debugPrint('[PAYMENT_FLOW] Items: ${_currentOrder!.items.length}');
+      debugPrint('[PAYMENT_FLOW] Total: £${_currentOrder!.totalDue.toStringAsFixed(2)}');
+      debugPrint('[PAYMENT_FLOW] Payment method: ${_currentOrder!.paymentMethod}');
+      
+      // Additional table flow logging
+      if (_currentOrder!.tableId != null) {
+        debugPrint('[TABLE_FLOW] Completing table order:');
+        debugPrint('[TABLE_FLOW]    order_id=${_currentOrder!.id}');
+        debugPrint('[TABLE_FLOW]    table_id=${_currentOrder!.tableId}');
+        debugPrint('[TABLE_FLOW]    table_number=${_currentOrder!.tableNumber}');
+      }
+      debugPrint('[SERVICE_CHARGE] complete: enabled=${_serviceChargeEnabled}, rate=${(_currentOrder!.serviceChargeRate * 100).toStringAsFixed(2)}%, total=£${_currentOrder!.totalDue.toStringAsFixed(2)}');
 
       // Convert in-memory Order to Supabase models with status='completed'
       final (eposOrder, eposItems) = _orderRepository.convertToEposModels(_currentOrder!);
@@ -1042,9 +1202,12 @@ class OrderProvider with ChangeNotifier {
         changeDue: _currentOrder!.changeDue,
       );
 
+      debugPrint('[PAYMENT_FLOW] Step 1: Saving order locally');
+      debugPrint('[PAYMENT_FLOW]    Will be marked sync_status=pending');
+      debugPrint('[PAYMENT_FLOW]    Will be queued for outbox sync');
+      debugPrint('[PAYMENT_FLOW]    Note: If order was previously synced, it will be re-pending for latest state');
+      
       // 1. Save order locally
-      debugPrint('[PAYMENT_FLOW] Saving order locally');
-      final orderSaved = await _orderRepository.convertToEposModels(_currentOrder!);
       final offlineRepo = OrderRepositoryOffline();
       final localOrderSaved = await offlineRepo.upsertOrderWithItems(
         completedOrder, 
@@ -1058,17 +1221,19 @@ class OrderProvider with ChangeNotifier {
       }
       debugPrint('[PAYMENT_FLOW] ✅ Order saved locally');
 
+      debugPrint('[PAYMENT_FLOW] Step 2: Saving order items locally (${eposItems.length} items)');
+      
       // 2. Save order items locally
-      debugPrint('[PAYMENT_FLOW] Saving order items locally');
       final itemsSaved = await offlineRepo.saveOrderItemsLocally(eposItems);
       if (!itemsSaved) {
         debugPrint('[PAYMENT_FLOW] ❌ Failed to save order items locally');
         return false;
       }
-      debugPrint('[PAYMENT_FLOW] ✅ Order items saved locally (${eposItems.length} items)');
+      debugPrint('[PAYMENT_FLOW] ✅ Order items saved locally');
 
+      debugPrint('[PAYMENT_FLOW] Step 3: Saving transaction(s) locally');
+      
       // 3. Save transaction(s) locally
-      debugPrint('[PAYMENT_FLOW] Saving transaction locally');
       if (splitPayments != null && splitPayments.isNotEmpty) {
         // Split bill: Create separate transactions for each payment method
         debugPrint('[PAYMENT_FLOW] Recording split bill transactions:');
@@ -1119,20 +1284,27 @@ class OrderProvider with ChangeNotifier {
       }
       debugPrint('[PAYMENT_FLOW] ✅ Transaction(s) saved locally');
 
-      debugPrint('[PAYMENT_FLOW] Local checkout save complete');
-
+      debugPrint('[PAYMENT_FLOW] Step 4: Verifying local save');
+      
       // 4. Verify local save with counts
       await _verifyLocalCheckoutSave(completedOrder.id, eposItems.length);
 
+      debugPrint('[PAYMENT_FLOW] Step 5: Processing inventory deduction');
+      
       // 5. Process inventory deduction
       final inventorySuccess = await _processInventoryDeduction();
       if (!inventorySuccess) {
         debugPrint('[PAYMENT_FLOW] ⚠️ Inventory deduction failed');
       }
 
+      debugPrint('[PAYMENT_FLOW] Step 6: Triggering background sync');
+      
       // 6. Trigger sync if online
       if (_connectionService.isOnline) {
-        debugPrint('[PAYMENT_FLOW] Triggering sync (device is online)');
+        debugPrint('[PAYMENT_FLOW] Device is online - triggering outbox sync');
+        debugPrint('[PAYMENT_FLOW]    Order will be upserted to Supabase via outbox');
+        debugPrint('[PAYMENT_FLOW]    Items will be upserted to Supabase via outbox');
+        debugPrint('[PAYMENT_FLOW]    Transaction will be inserted to Supabase via outbox');
         // Trigger sync in background - don't wait for it
         _triggerBackgroundSync();
       } else {
@@ -1140,6 +1312,11 @@ class OrderProvider with ChangeNotifier {
       }
 
       debugPrint('[PAYMENT_FLOW] ✅ Offline-first checkout complete');
+      debugPrint('[PAYMENT_FLOW]    Order: ${completedOrder.id}');
+      debugPrint('[PAYMENT_FLOW]    Status: completed');
+      debugPrint('[PAYMENT_FLOW]    Local sync_status: pending');
+      debugPrint('[PAYMENT_FLOW]    Queued for: UPSERT to Supabase');
+      debugPrint('[PAYMENT_FLOW] ════════════════════════════════════════');
       return true;
     } catch (e, stackTrace) {
       debugPrint('[PAYMENT_FLOW] ❌ Error in offline-first checkout: $e');

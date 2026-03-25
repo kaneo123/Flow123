@@ -8,6 +8,10 @@ import 'package:uuid/uuid.dart';
 
 /// Service for managing table/tab session locks with real-time awareness
 /// 
+/// Platform-aware behavior:
+/// - WEB: Direct Supabase operations for table_sessions (real-time, heartbeat, etc)
+/// - DEVICE: Deferred/no-op behavior to avoid FK violations with local-first orders
+/// 
 /// Implements a hybrid soft-locking approach:
 /// - Sessions track who has a table/tab open
 /// - Real-time updates notify when someone else opens the same table
@@ -34,6 +38,10 @@ class TableLockService {
 
   /// Start a new session for an order/table
   /// Returns the created session or null if failed
+  /// 
+  /// Platform-aware behavior:
+  /// - WEB: Creates table_session in Supabase immediately
+  /// - DEVICE: Defers table_session creation to avoid FK violations with local-first orders
   Future<TableSession?> startSession({
     required String outletId,
     required String orderId,
@@ -41,7 +49,42 @@ class TableLockService {
     required String staffId,
     required String staffName,
   }) async {
+    if (kIsWeb) {
+      // WEB: Direct Supabase insert
+      return _startSessionWeb(
+        outletId: outletId,
+        orderId: orderId,
+        tableId: tableId,
+        staffId: staffId,
+        staffName: staffName,
+      );
+    } else {
+      // DEVICE: Defer session creation to avoid FK violations
+      // Table sessions will be created during sync after parent order exists in cloud
+      debugPrint('[TABLE_SESSION_SYNC] Device: Deferring table_session creation (local-first order)');
+      debugPrint('[TABLE_SESSION_SYNC]    Order: $orderId');
+      debugPrint('[TABLE_SESSION_SYNC]    Table: $tableId');
+      debugPrint('[TABLE_SESSION_SYNC]    Reason: Parent order may only exist locally, FK violation risk');
+      
+      // For device builds, we just track the session locally in memory
+      // Real-time locking/heartbeat not needed for device builds (single-device operation)
+      _currentSessionId = null; // No remote session ID on device
+      return null; // Session creation deferred
+    }
+  }
+  
+  /// WEB ONLY: Create table_session in Supabase
+  Future<TableSession?> _startSessionWeb({
+    required String outletId,
+    required String orderId,
+    String? tableId,
+    required String staffId,
+    required String staffName,
+  }) async {
     try {
+      debugPrint('[TABLE_SESSION_SYNC] Web: Creating table_session in Supabase');
+      debugPrint('[TABLE_SESSION_SYNC]    Order: $orderId');
+      
       final deviceId = await DeviceIdentificationService.instance.getDeviceId();
       final now = DateTime.now();
       
@@ -60,6 +103,7 @@ class TableLockService {
       final result = await SupabaseService.insert('table_sessions', sessionData);
       
       if (!result.isSuccess || result.data == null || result.data!.isEmpty) {
+        debugPrint('[TABLE_SESSION_SYNC] ❌ Failed to create session: ${result.error}');
         return null;
       }
 
@@ -72,15 +116,18 @@ class TableLockService {
       // Subscribe to real-time updates for this order
       _subscribeToOrderSessions(orderId, staffId);
       
+      debugPrint('[TABLE_SESSION_SYNC] ✅ Session created: ${session.id}');
       return session;
     } catch (e, stackTrace) {
+      debugPrint('[TABLE_SESSION_SYNC] ❌ Error creating session: $e');
       return null;
     }
   }
 
   /// Update heartbeat to keep session alive
+  /// Only active on web builds where real-time sessions are created
   Future<void> _updateHeartbeat() async {
-    if (_currentSessionId == null) return;
+    if (!kIsWeb || _currentSessionId == null) return;
 
     try {
       await SupabaseService.update(
@@ -105,10 +152,13 @@ class TableLockService {
   }
 
   /// End the current session
+  /// Only active on web builds where real-time sessions exist
   Future<void> endSession() async {
-    if (_currentSessionId == null) return;
+    if (!kIsWeb || _currentSessionId == null) return;
 
     try {
+      debugPrint('[TABLE_SESSION_SYNC] Ending session: $_currentSessionId');
+      
       await SupabaseService.update(
         'table_sessions',
         {
@@ -122,13 +172,21 @@ class TableLockService {
       _heartbeatTimer?.cancel();
       _heartbeatTimer = null;
       _unsubscribeFromRealtime();
+      
+      debugPrint('[TABLE_SESSION_SYNC] ✅ Session ended');
     } catch (e) {
-      // Silently fail
+      debugPrint('[TABLE_SESSION_SYNC] ⚠️ Error ending session: $e');
     }
   }
 
   /// Get all active sessions for an order
+  /// Only functional on web builds
   Future<List<TableSession>> getActiveSessionsForOrder(String orderId) async {
+    if (!kIsWeb) {
+      debugPrint('[TABLE_SESSION_SYNC] Device: Skipping session query (not applicable for device builds)');
+      return [];
+    }
+    
     try {
       final result = await SupabaseService.select(
         'table_sessions',
@@ -159,6 +217,7 @@ class TableLockService {
   }
 
   /// Take over - end other sessions and start a new one
+  /// Only functional on web builds
   Future<TableSession?> takeOver({
     required String outletId,
     required String orderId,
@@ -166,7 +225,14 @@ class TableLockService {
     required String staffId,
     required String staffName,
   }) async {
+    if (!kIsWeb) {
+      debugPrint('[TABLE_SESSION_SYNC] Device: Skipping takeover (not applicable for device builds)');
+      return null;
+    }
+    
     try {
+      debugPrint('[TABLE_SESSION_SYNC] Taking over sessions for order: $orderId');
+      
       // End all other active sessions for this order
       await SupabaseService.update(
         'table_sessions',
@@ -186,12 +252,16 @@ class TableLockService {
         staffName: staffName,
       );
     } catch (e) {
+      debugPrint('[TABLE_SESSION_SYNC] ❌ Error during takeover: $e');
       return null;
     }
   }
 
   /// Subscribe to real-time updates for an order's sessions
+  /// Only active on web builds
   void _subscribeToOrderSessions(String orderId, String currentStaffId) {
+    if (!kIsWeb) return; // Real-time not needed on device builds
+    
     _unsubscribeFromRealtime();
     
     try {

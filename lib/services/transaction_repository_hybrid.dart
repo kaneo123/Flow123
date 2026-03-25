@@ -199,13 +199,30 @@ class TransactionRepositoryHybrid {
       }
       if (columnNames.contains('created_at')) localTransaction['created_at'] = transaction.createdAt.millisecondsSinceEpoch;
       
-      // Mark as pending for local-origin transactions
+      // Check if transaction already exists and is synced (transactional update path)
+      if (hasSyncStatus) {
+        final existing = await db.query(
+          'transactions',
+          where: 'id = ?',
+          whereArgs: [transaction.id],
+          limit: 1,
+        );
+        
+        if (existing.isNotEmpty) {
+          final existingSyncStatus = existing.first['sync_status'] as String?;
+          if (existingSyncStatus == 'synced') {
+            debugPrint('[TRANSACTION_REPO]    🔄 Transaction ${transaction.id} was synced, re-marking as pending (transactional update)');
+          }
+        }
+      }
+      
+      // Mark as pending for local-origin transactions (or re-pending for synced transactions being modified)
       if (hasSyncStatus) {
         localTransaction['sync_status'] = 'pending';
         localTransaction['sync_error'] = null;
         localTransaction['last_sync_attempt_at'] = null;
         localTransaction['sync_attempt_count'] = 0;
-        debugPrint('[TRANSACTION_REPO]    Marked as sync_status=pending (local-origin)');
+        debugPrint('[TRANSACTION_REPO]    Marked as sync_status=pending (local-origin or transactional update)');
       }
       
       // Safe upsert

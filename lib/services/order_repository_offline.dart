@@ -25,8 +25,18 @@ class OrderRepositoryOffline {
     int? covers,
   }) async {
     final now = DateTime.now();
+    final orderId = _uuid.v4();
+    
+    // Log table identity if this is a table order
+    if (orderType == 'table' && tableId != null) {
+      debugPrint('[TABLE_FLOW] Creating order header:');
+      debugPrint('[TABLE_FLOW]    order_id=$orderId');
+      debugPrint('[TABLE_FLOW]    table_id=$tableId');
+      debugPrint('[TABLE_FLOW]    table_number=$tableNumber');
+    }
+    
     final order = EposOrder(
-      id: _uuid.v4(),
+      id: orderId,
       outletId: outletId,
       staffId: staffId,
       orderType: orderType,
@@ -45,8 +55,13 @@ class OrderRepositoryOffline {
 
   /// Save order to local DB and queue for sync
   /// 
-  /// CRITICAL: This is for LOCALLY-CREATED orders only.
-  /// Mirrored cloud-origin orders should use MirrorContentSyncService.importMirroredRow()
+  /// USAGE CONTEXTS:
+  /// 1. LOCAL USER EDIT (queueForSync=true): User creates/modifies order on device
+  ///    - Allowed to update even if row is currently 'synced'
+  ///    - Re-marks row as 'pending' to trigger re-sync of latest state
+  /// 2. MIRROR IMPORT (queueForSync=false): Cloud-origin row being imported during mirror sync
+  ///    - Protected from accidentally marking synced rows as pending
+  ///    - Should use MirrorContentSyncService.importMirroredRow() instead
   Future<bool> upsertOrderWithItems(
     EposOrder order,
     List<EposOrderItem> items, {
@@ -62,9 +77,11 @@ class OrderRepositoryOffline {
       // Check if orders table has sync_status column (new offline sync system)
       final hasSyncStatus = columnNames.contains('sync_status');
       
-      // PROTECTION: Check if row already exists with sync_status='synced'
-      // If so, refuse to downgrade it to pending (prevents mirrored rows from being corrupted)
-      if (hasSyncStatus) {
+      // TRANSACTIONAL UPDATE LOGIC:
+      // Allow updating synced orders if this is a legitimate user edit (queueForSync=true)
+      // Only block if this is a mirror import trying to overwrite a synced row (queueForSync=false)
+      if (hasSyncStatus && !queueForSync) {
+        // Mirror import path - protect synced rows from being corrupted
         final existing = await db.query(
           'orders',
           where: 'id = ?',
@@ -75,10 +92,29 @@ class OrderRepositoryOffline {
         if (existing.isNotEmpty) {
           final existingSyncStatus = existing.first['sync_status'] as String?;
           if (existingSyncStatus == 'synced') {
-            debugPrint('[ORDER_REPO] ⚠️ PROTECTION: Refusing to overwrite synced order ${order.id} with local save');
-            debugPrint('[ORDER_REPO]    This order came from cloud and should not be downgraded to pending');
-            debugPrint('[ORDER_REPO]    If this is a legitimate local modification, update the existing row carefully');
+            debugPrint('[ORDER_REPO] ⚠️ PROTECTION: Refusing to overwrite synced order ${order.id} during mirror import');
+            debugPrint('[ORDER_REPO]    This order came from cloud and should not be marked pending');
+            debugPrint('[ORDER_REPO]    Use MirrorContentSyncService.importMirroredRow() for cloud-origin rows');
             return false;
+          }
+        }
+      }
+      
+      // User edit path - check if we're updating a synced order
+      if (hasSyncStatus && queueForSync) {
+        final existing = await db.query(
+          'orders',
+          where: 'id = ?',
+          whereArgs: [order.id],
+          limit: 1,
+        );
+        
+        if (existing.isNotEmpty) {
+          final existingSyncStatus = existing.first['sync_status'] as String?;
+          if (existingSyncStatus == 'synced') {
+            debugPrint('[ORDER_REPO] 🔄 TRANSACTIONAL UPDATE: Order ${order.id} was synced, re-marking as pending');
+            debugPrint('[ORDER_REPO]    Reason: Legitimate user modification (park/complete/add item)');
+            debugPrint('[ORDER_REPO]    Action: Will update local row and re-sync latest state');
           }
         }
       }
@@ -92,8 +128,17 @@ class OrderRepositoryOffline {
       // Map fields only if they exist in the actual schema
       if (columnNames.contains('outlet_id')) localOrder['outlet_id'] = order.outletId;
       if (columnNames.contains('table_id')) localOrder['table_id'] = order.tableId;
+      if (columnNames.contains('table_number')) localOrder['table_number'] = order.tableNumber;
       if (columnNames.contains('staff_id')) localOrder['staff_id'] = order.staffId;
       if (columnNames.contains('status')) localOrder['status'] = order.status;
+      
+      // Log table identity for table orders
+      if (order.orderType == 'table' && order.tableId != null) {
+        debugPrint('[TABLE_FLOW] Saving order to local DB:');
+        debugPrint('[TABLE_FLOW]    order_id=${order.id}');
+        debugPrint('[TABLE_FLOW]    table_id=${order.tableId}');
+        debugPrint('[TABLE_FLOW]    table_number=${order.tableNumber}');
+      }
       if (columnNames.contains('order_type')) localOrder['order_type'] = order.orderType;
       if (columnNames.contains('subtotal')) localOrder['subtotal'] = order.subtotal;
       if (columnNames.contains('notes')) localOrder['notes'] = order.notes;
@@ -151,11 +196,12 @@ class OrderRepositoryOffline {
         debugPrint('[ORDER_REPO]    ✅ Updated existing local order: ${order.id}');
       }
 
-      // Add to outbox queue for sync
+      // Add to outbox queue for sync (with deduplication)
       if (queueForSync) {
         final orderJson = order.toJson();
         orderJson['items'] = items.map((i) => i.toJson()).toList();
         
+        // Queue will deduplicate if an entry already exists
         await _db.addToOutbox(
           entityType: 'order',
           entityId: order.id,
@@ -163,7 +209,7 @@ class OrderRepositoryOffline {
           payload: orderJson,
         );
         
-        debugPrint('[ORDER_REPO]    ✅ Queued for upload via outbox');
+        debugPrint('[ORDER_REPO]    ✅ Queued for upload via outbox (deduplication handled by queue)');
       }
 
       return true;
@@ -293,18 +339,48 @@ class OrderRepositoryOffline {
   }
 
   /// Get order items for a specific order
+  /// Queries order_items table (not orders.items column)
   Future<List<EposOrderItem>> getOrderItems(String orderId) async {
     try {
-      final localOrder = await _db.getOrderById(orderId);
+      final db = await _db.database;
       
-      if (localOrder == null) {
+      // Query order_items table directly (most schemas don't store items in orders table)
+      final localItems = await db.query(
+        'order_items',
+        where: 'order_id = ?',
+        whereArgs: [orderId],
+        orderBy: 'sort_order ASC',
+      );
+      
+      if (localItems.isEmpty) {
         return [];
       }
-
-      final itemsJson = jsonDecode(localOrder['items'] as String) as List<dynamic>;
-      final items = itemsJson.map((json) => EposOrderItem.fromJson(json as Map<String, dynamic>)).toList();
+      
+      // Convert local items to EposOrderItem
+      // CRITICAL: Do not use empty strings for UUID fields - use null instead
+      final items = localItems.map((row) {
+        final productId = row['product_id'] as String?;
+        final categoryId = row['category_id'] as String?;
+        
+        return EposOrderItem(
+          id: row['id'] as String,
+          orderId: row['order_id'] as String,
+          productId: productId?.isEmpty ?? true ? null : productId,
+          productName: row['product_name'] as String,
+          plu: row['plu'] as String?,
+          categoryId: categoryId?.isEmpty ?? true ? null : categoryId,
+          unitPrice: (row['unit_price'] as num).toDouble(),
+          quantity: (row['quantity'] as num).toDouble(),
+          taxRate: (row['tax_rate'] as num?)?.toDouble() ?? 0.0,
+          course: row['course'] as String?,
+          sortOrder: row['sort_order'] as int? ?? 0,
+        );
+      }).toList();
+      
       return items;
-    } catch (e) {
+    } catch (e, stackTrace) {
+      debugPrint('[ORDER_REPO_OFFLINE] ❌ Failed to get order items: $e');
+      debugPrint('Stack: $stackTrace');
       return [];
     }
   }
@@ -343,8 +419,60 @@ class OrderRepositoryOffline {
   }
 
   /// Park an order
+  /// Updates local row status to 'parked' and queues for sync
   Future<bool> parkOrder(String orderId) async {
     try {
+      final db = await _db.database;
+      final now = DateTime.now();
+      
+      // Get actual local table columns
+      final tableInfo = await db.rawQuery('PRAGMA table_info(orders)');
+      final columnNames = tableInfo.map((col) => col['name'] as String).toSet();
+      final hasSyncStatus = columnNames.contains('sync_status');
+      
+      // Build update map with only existing columns
+      final updateData = <String, dynamic>{
+        'status': 'parked',
+        'updated_at': now.millisecondsSinceEpoch,
+      };
+      
+      if (columnNames.contains('parked_at')) {
+        updateData['parked_at'] = now.millisecondsSinceEpoch;
+      }
+      
+      // Re-mark as pending if synced (transactional update)
+      if (hasSyncStatus) {
+        final existing = await db.query(
+          'orders',
+          where: 'id = ?',
+          whereArgs: [orderId],
+          limit: 1,
+        );
+        
+        if (existing.isNotEmpty) {
+          final existingSyncStatus = existing.first['sync_status'] as String?;
+          if (existingSyncStatus == 'synced') {
+            debugPrint('[ORDER_REPO_OFFLINE] 🔄 Park: Order $orderId was synced, re-marking as pending');
+          }
+        }
+        
+        updateData['sync_status'] = 'pending';
+        updateData['sync_error'] = null;
+        updateData['last_sync_attempt_at'] = null;
+        updateData['sync_attempt_count'] = 0;
+      }
+      
+      // Update local row
+      await db.update(
+        'orders',
+        updateData,
+        where: 'id = ?',
+        whereArgs: [orderId],
+      );
+      
+      debugPrint('[ORDER_REPO_OFFLINE] ✅ Local row updated to status=parked, sync_status=pending');
+      
+      // Queue for sync
       await _db.addToOutbox(
         entityType: 'order',
         entityId: orderId,
@@ -352,12 +480,14 @@ class OrderRepositoryOffline {
         payload: {
           'id': orderId,
           'status': 'parked',
-          'parked_at': DateTime.now().toIso8601String(),
+          'parked_at': now.toIso8601String(),
         },
       );
 
       return true;
-    } catch (e) {
+    } catch (e, stackTrace) {
+      debugPrint('[ORDER_REPO_OFFLINE] ❌ Failed to park order: $e');
+      debugPrint('Stack: $stackTrace');
       return false;
     }
   }
@@ -390,6 +520,9 @@ class OrderRepositoryOffline {
 
   /// Save order items locally with sync_status='pending'
   /// For locally-created order items that need to be synced to Supabase
+  /// 
+  /// TRANSACTIONAL UPDATES: If an item already exists with sync_status='synced',
+  /// it will be re-marked as 'pending' to trigger re-sync of latest state
   Future<bool> saveOrderItemsLocally(List<EposOrderItem> items) async {
     if (items.isEmpty) return true;
     
@@ -404,6 +537,23 @@ class OrderRepositoryOffline {
       debugPrint('[ORDER_REPO_OFFLINE] 💾 Saving ${items.length} order items locally');
       
       for (final item in items) {
+        // Check if item already exists and is synced
+        if (hasSyncStatus) {
+          final existing = await db.query(
+            'order_items',
+            where: 'id = ?',
+            whereArgs: [item.id],
+            limit: 1,
+          );
+          
+          if (existing.isNotEmpty) {
+            final existingSyncStatus = existing.first['sync_status'] as String?;
+            if (existingSyncStatus == 'synced') {
+              debugPrint('[ORDER_REPO_OFFLINE]    🔄 Item ${item.id} was synced, re-marking as pending (transactional update)');
+            }
+          }
+        }
+        
         // Build item data map using only columns that exist
         final localItem = <String, dynamic>{
           'id': item.id,
@@ -428,7 +578,7 @@ class OrderRepositoryOffline {
         }
         if (columnNames.contains('created_at')) localItem['created_at'] = DateTime.now().millisecondsSinceEpoch;
         
-        // Mark as pending for local-origin items
+        // Mark as pending for local-origin items (or re-pending for synced items being modified)
         if (hasSyncStatus) {
           localItem['sync_status'] = 'pending';
           localItem['sync_error'] = null;
@@ -517,14 +667,27 @@ class OrderRepositoryOffline {
     final totalPaid = (localOrder['total_paid'] as num?)?.toDouble() ?? 0.0;
     final changeDue = (localOrder['change_due'] as num?)?.toDouble() ?? 0.0;
 
+    final orderId = localOrder['id'] as String;
+    final orderType = localOrder['order_type'] as String? ?? 'quick_service';
+    final tableId = localOrder['table_id'] as String?;
+    final tableNumber = localOrder['table_number'] as String?;
+    
+    // Log table identity for table orders being loaded from local DB
+    if (orderType == 'table' && tableId != null) {
+      debugPrint('[TABLE_FLOW] Loading order from local DB:');
+      debugPrint('[TABLE_FLOW]    order_id=$orderId');
+      debugPrint('[TABLE_FLOW]    table_id=$tableId');
+      debugPrint('[TABLE_FLOW]    table_number=$tableNumber');
+    }
+
     return EposOrder(
-      id: localOrder['id'] as String,
+      id: orderId,
       outletId: localOrder['outlet_id'] as String,
       staffId: localOrder['staff_id'] as String?,
-      orderType: localOrder['order_type'] as String? ?? 'quick_service',
+      orderType: orderType,
       status: localOrder['status'] as String,
-      tableId: localOrder['table_id'] as String?,
-      tableNumber: (localOrder['table_id'] as String?)?.split('-').last,
+      tableId: tableId,
+      tableNumber: tableNumber,
       subtotal: subtotal,
       taxAmount: taxAmount,
       serviceCharge: serviceCharge,
@@ -575,13 +738,17 @@ class OrderRepositoryOffline {
       final index = entry.key;
       final item = entry.value;
       
+      // Normalize UUID fields: convert empty strings to null
+      final productId = item.product.id.isEmpty ? null : item.product.id;
+      final categoryId = item.product.categoryId?.isEmpty ?? true ? null : item.product.categoryId;
+      
       return EposOrderItem(
         id: item.id,
         orderId: order.id,
-        productId: item.product.id,
+        productId: productId,
         productName: item.product.name,
-        plu: '',
-        categoryId: item.product.categoryId ?? '',
+        plu: null,  // Use null instead of empty string
+        categoryId: categoryId,
         unitPrice: item.product.price,
         quantity: item.quantity.toDouble(),
         taxRate: item.taxRate,

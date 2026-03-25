@@ -400,15 +400,17 @@ class _OrderPanelState extends State<OrderPanel> with TickerProviderStateMixin {
     );
 
     final titleRow = Row(
-      mainAxisSize: MainAxisSize.min,
       children: [
-        Text(
-          'Current Order',
-          style: compact
-              ? context.textStyles.titleMedium?.semiBold
-              : (isMobile 
-                  ? context.textStyles.titleLarge 
-                  : context.textStyles.headlineSmall)?.semiBold,
+        Expanded(
+          child: Text(
+            'Current Order',
+            style: compact
+                ? context.textStyles.titleMedium?.semiBold
+                : (isMobile 
+                    ? context.textStyles.titleLarge 
+                    : context.textStyles.headlineSmall)?.semiBold,
+            overflow: TextOverflow.ellipsis,
+          ),
         ),
         if (isMobile && !showCloseButton) ...[
           const SizedBox(width: 8),
@@ -508,6 +510,15 @@ class _OrderPanelState extends State<OrderPanel> with TickerProviderStateMixin {
           Consumer<OrderProvider>(
             builder: (context, orderProvider, _) {
               final tableNumber = orderProvider.currentOrder?.tableNumber;
+              final tableId = orderProvider.currentOrder?.tableId;
+              
+              // Log table identity when rendering order header
+              if (tableNumber != null && tableId != null) {
+                debugPrint('[ORDER_HEADER] Rendering table order header:');
+                debugPrint('[ORDER_HEADER]    table_id=$tableId');
+                debugPrint('[ORDER_HEADER]    table_number=$tableNumber');
+              }
+              
               if (tableNumber == null) return const SizedBox.shrink();
               
               return Container(

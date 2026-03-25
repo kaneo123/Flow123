@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
@@ -55,8 +56,12 @@ class _TabsTablesScreenState extends State<TabsTablesScreen> with SingleTickerPr
       return;
     }
 
-    final tables = await _orderRepository.getOpenTables(outlet.id, includeOffline: false);
-    final tabs = await _orderRepository.getOpenTabs(outlet.id, includeOffline: false);
+    // Device builds: include offline-first pending orders
+    // Web builds: online-only
+    final includeOffline = !kIsWeb;
+    
+    final tables = await _orderRepository.getOpenTables(outlet.id, includeOffline: includeOffline);
+    final tabs = await _orderRepository.getOpenTabs(outlet.id, includeOffline: includeOffline);
 
     // Load active sessions for each order
     final sessionsByOrderId = <String, List<TableSession>>{};

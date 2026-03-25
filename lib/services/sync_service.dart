@@ -533,15 +533,18 @@ class SyncService {
           // Strip local-only fields and items array before uploading
           final cleanPayload = _cleanOrderPayloadForUpload(payload);
           debugPrint('[OUTBOX_SYNC] Uploading order $entityId with payload keys: ${cleanPayload.keys.toList()}');
+          debugPrint('[OUTBOX_SYNC]    Using UPSERT (idempotent retries)');
           
           try {
-            await supabase.from('orders').insert(cleanPayload);
-            debugPrint('[OUTBOX_SYNC] ✅ Order sync success: $entityId');
+            // Use UPSERT instead of INSERT for idempotent retries
+            // onConflict: 'id' means if row with this ID exists, update it instead of failing
+            await supabase.from('orders').upsert(cleanPayload, onConflict: 'id');
+            debugPrint('[OUTBOX_SYNC] ✅ Order upsert success: $entityId');
             
             // Mark local row as synced
             await _markLocalRowSynced('orders', entityId);
           } catch (e) {
-            debugPrint('[OUTBOX_SYNC] ❌ Order sync failure: $entityId - $e');
+            debugPrint('[OUTBOX_SYNC] ❌ Order upsert failure: $entityId - $e');
             rethrow;
           }
         } else if (operation == 'update') {
@@ -567,15 +570,17 @@ class SyncService {
           // Strip local-only fields before uploading
           final cleanPayload = _cleanOrderItemPayloadForUpload(payload);
           debugPrint('[OUTBOX_SYNC] Uploading order_item $entityId with payload keys: ${cleanPayload.keys.toList()}');
+          debugPrint('[OUTBOX_SYNC]    Using UPSERT (idempotent retries)');
           
           try {
-            await supabase.from('order_items').insert(cleanPayload);
-            debugPrint('[OUTBOX_SYNC] ✅ Order item sync success: $entityId');
+            // Use UPSERT instead of INSERT for idempotent retries
+            await supabase.from('order_items').upsert(cleanPayload, onConflict: 'id');
+            debugPrint('[OUTBOX_SYNC] ✅ Order item upsert success: $entityId');
             
             // Mark local row as synced
             await _markLocalRowSynced('order_items', entityId);
           } catch (e) {
-            debugPrint('[OUTBOX_SYNC] ❌ Order item sync failure: $entityId - $e');
+            debugPrint('[OUTBOX_SYNC] ❌ Order item upsert failure: $entityId - $e');
             rethrow;
           }
         }
@@ -586,15 +591,17 @@ class SyncService {
           // Strip local-only fields before uploading
           final cleanPayload = _cleanTransactionPayloadForUpload(payload);
           debugPrint('[OUTBOX_SYNC] Uploading transaction $entityId with payload keys: ${cleanPayload.keys.toList()}');
+          debugPrint('[OUTBOX_SYNC]    Using UPSERT (idempotent retries)');
           
           try {
-            await supabase.from('transactions').insert(cleanPayload);
-            debugPrint('[OUTBOX_SYNC] ✅ Transaction sync success: $entityId');
+            // Use UPSERT instead of INSERT for idempotent retries
+            await supabase.from('transactions').upsert(cleanPayload, onConflict: 'id');
+            debugPrint('[OUTBOX_SYNC] ✅ Transaction upsert success: $entityId');
             
             // Mark local row as synced
             await _markLocalRowSynced('transactions', entityId);
           } catch (e) {
-            debugPrint('[OUTBOX_SYNC] ❌ Transaction sync failure: $entityId - $e');
+            debugPrint('[OUTBOX_SYNC] ❌ Transaction upsert failure: $entityId - $e');
             rethrow;
           }
         }
@@ -649,6 +656,29 @@ class SyncService {
     clean.remove('last_sync_attempt_at');
     clean.remove('sync_attempt_count');
     clean.remove('device_id');
+    
+    // CRITICAL: Normalize UUID fields - convert empty strings to null
+    // PostgreSQL UUID columns reject empty strings with error 22P02
+    final uuidFields = [
+      'product_id',
+      'inventory_item_id',
+      'category_id',
+      'order_id',
+      'modifier_line_id',
+    ];
+    
+    int normalizedCount = 0;
+    for (final field in uuidFields) {
+      if (clean.containsKey(field) && clean[field] is String && (clean[field] as String).isEmpty) {
+        debugPrint('[ORDER_ITEM_SYNC] 🔧 Normalized empty UUID field $field -> null');
+        clean[field] = null;
+        normalizedCount++;
+      }
+    }
+    
+    if (normalizedCount > 0) {
+      debugPrint('[ORDER_ITEM_SYNC] ✅ Sanitized $normalizedCount UUID fields, safe for Supabase');
+    }
     
     return clean;
   }

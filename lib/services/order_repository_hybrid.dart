@@ -77,21 +77,34 @@ class OrderRepositoryHybrid {
     return localOrder;
   }
 
-  /// Upsert order + items, queue if Supabase fails
+  /// Upsert order + items
+  /// Platform-aware: Device builds use offline-first, web tries cloud first
   Future<bool> upsertOrderWithItems(EposOrder order, List<EposOrderItem> items) async {
-    final isOnline = _connectionService.isOnline;
-    if (isOnline) {
-      try {
-        final saved = await _cloudRepo.upsertOrderWithItems(order, items);
-        if (saved) return true;
-      } catch (e, stack) {
-        debugPrint('⚠️ Hybrid upsertOrderWithItems failed online, will fallback: $e');
-        debugPrint('Stack: $stack');
+    debugPrint('[ORDER_REPO] upsertOrderWithItems: ${order.id} (platform: ${kIsWeb ? "web" : "device"})');
+    
+    if (kIsWeb) {
+      // Web: Try cloud first, fallback to local if fails
+      final isOnline = _connectionService.isOnline;
+      if (isOnline) {
+        try {
+          final saved = await _cloudRepo.upsertOrderWithItems(order, items);
+          if (saved) {
+            debugPrint('[ORDER_REPO] ✅ Web: Saved to Supabase directly');
+            return true;
+          }
+        } catch (e, stack) {
+          debugPrint('[ORDER_REPO] ⚠️ Web: Supabase upsert failed, will fallback: $e');
+          debugPrint('Stack: $stack');
+        }
       }
-    }
 
-    debugPrint('📥 Falling back to local queue for order ${order.id}');
-    return _offlineRepo.upsertOrderWithItems(order, items);
+      debugPrint('[ORDER_REPO] 📥 Web: Falling back to local queue');
+      return _offlineRepo.upsertOrderWithItems(order, items);
+    } else {
+      // Device: LOCAL-ONLY (no Supabase upsert, only local save + queue)
+      debugPrint('[ORDER_REPO] Device: Saving locally with sync_status=pending');
+      return _offlineRepo.upsertOrderWithItems(order, items, queueForSync: true);
+    }
   }
 
   Future<bool> completeOrder(String orderId, {
@@ -99,61 +112,102 @@ class OrderRepositoryHybrid {
     required double amountPaid,
     double changeDue = 0.0,
   }) async {
-    final isOnline = _connectionService.isOnline;
-    if (isOnline) {
-      try {
-        final success = await _cloudRepo.completeOrder(
-          orderId,
-          paymentMethod: paymentMethod,
-          amountPaid: amountPaid,
-          changeDue: changeDue,
-        );
-        if (success) return true;
-      } catch (e, stack) {
-        debugPrint('⚠️ Hybrid completeOrder failed online, will fallback: $e');
-        debugPrint('Stack: $stack');
+    debugPrint('[ORDER_REPO] completeOrder: $orderId (platform: ${kIsWeb ? "web" : "device"})');
+    
+    if (kIsWeb) {
+      // Web: Try cloud first, fallback to local if fails
+      final isOnline = _connectionService.isOnline;
+      if (isOnline) {
+        try {
+          final success = await _cloudRepo.completeOrder(
+            orderId,
+            paymentMethod: paymentMethod,
+            amountPaid: amountPaid,
+            changeDue: changeDue,
+          );
+          if (success) {
+            debugPrint('[ORDER_REPO] ✅ Web: Completed order on Supabase');
+            return true;
+          }
+        } catch (e, stack) {
+          debugPrint('[ORDER_REPO] ⚠️ Web: Supabase complete failed, will fallback: $e');
+          debugPrint('Stack: $stack');
+        }
       }
-    }
 
-    debugPrint('📥 Falling back to local completion for order $orderId');
-    return _offlineRepo.completeOrder(
-      orderId,
-      paymentMethod: paymentMethod,
-      amountPaid: amountPaid,
-      changeDue: changeDue,
-    );
+      debugPrint('[ORDER_REPO] 📥 Web: Falling back to local completion');
+      return _offlineRepo.completeOrder(
+        orderId,
+        paymentMethod: paymentMethod,
+        amountPaid: amountPaid,
+        changeDue: changeDue,
+      );
+    } else {
+      // Device: LOCAL-ONLY (no Supabase update, only local + queue)
+      debugPrint('[ORDER_REPO] Device: Completing order locally with sync_status=pending');
+      return _offlineRepo.completeOrder(
+        orderId,
+        paymentMethod: paymentMethod,
+        amountPaid: amountPaid,
+        changeDue: changeDue,
+      );
+    }
   }
 
   Future<bool> parkOrder(String orderId) async {
-    final isOnline = _connectionService.isOnline;
-    if (isOnline) {
-      try {
-        final success = await _cloudRepo.parkOrder(orderId);
-        if (success) return true;
-      } catch (e, stack) {
-        debugPrint('⚠️ Hybrid parkOrder failed online, will fallback: $e');
-        debugPrint('Stack: $stack');
+    debugPrint('[PARK_ORDER] parkOrder: $orderId (platform: ${kIsWeb ? "web" : "device"})');
+    
+    if (kIsWeb) {
+      // Web: Try cloud first, fallback to local if fails
+      final isOnline = _connectionService.isOnline;
+      if (isOnline) {
+        try {
+          final success = await _cloudRepo.parkOrder(orderId);
+          if (success) {
+            debugPrint('[PARK_ORDER] ✅ Web: Parked order on Supabase');
+            return true;
+          }
+        } catch (e, stack) {
+          debugPrint('[PARK_ORDER] ⚠️ Web: Supabase park failed, will fallback: $e');
+          debugPrint('Stack: $stack');
+        }
       }
-    }
 
-    debugPrint('📥 Falling back to local park for order $orderId');
-    return _offlineRepo.parkOrder(orderId);
+      debugPrint('[PARK_ORDER] 📥 Web: Falling back to local park');
+      return _offlineRepo.parkOrder(orderId);
+    } else {
+      // Device: LOCAL-ONLY (no Supabase update, only local + queue)
+      debugPrint('[PARK_ORDER] Device: Parking order locally (will update existing outbox entry if present)');
+      return _offlineRepo.parkOrder(orderId);
+    }
   }
 
   Future<bool> voidOrder(String orderId) async {
-    final isOnline = _connectionService.isOnline;
-    if (isOnline) {
-      try {
-        final success = await _cloudRepo.voidOrder(orderId);
-        if (success) return true;
-      } catch (e, stack) {
-        debugPrint('⚠️ Hybrid voidOrder failed online, will fallback: $e');
-        debugPrint('Stack: $stack');
+    debugPrint('[ORDER_REPO] voidOrder: $orderId (platform: ${kIsWeb ? "web" : "device"})');
+    
+    if (kIsWeb) {
+      // Web: Try cloud first, fallback to local if fails
+      final isOnline = _connectionService.isOnline;
+      if (isOnline) {
+        try {
+          final success = await _cloudRepo.voidOrder(orderId);
+          if (success) {
+            debugPrint('[ORDER_REPO] ✅ Web: Voided order on Supabase');
+            return true;
+          }
+        } catch (e, stack) {
+          debugPrint('[ORDER_REPO] ⚠️ Web: Supabase void failed, will fallback: $e');
+          debugPrint('Stack: $stack');
+        }
       }
-    }
 
-    debugPrint('📥 Falling back to local void for order $orderId');
-    return _offlineRepo.voidOrder(orderId);
+      debugPrint('[ORDER_REPO] 📥 Web: Falling back to local void');
+      return _offlineRepo.voidOrder(orderId);
+    } else {
+      // Device: LOCAL-ONLY (no Supabase update, only local + queue)
+      debugPrint('[ORDER_REPO] Device: Voiding order locally with sync_status=pending');
+      return _offlineRepo.voidOrder(orderId);
+    }
   }
 
   /// Combine cloud + offline orders (offline entries override only if cloud missing)
@@ -265,22 +319,54 @@ class OrderRepositoryHybrid {
   }
 
   Future<EposOrder?> getOrderById(String orderId, {bool onlineOnly = false}) async {
-    try {
-      final cloud = await _cloudRepo.getOrderById(orderId);
-      if (cloud != null) return cloud;
-    } catch (e, stack) {
-      debugPrint('⚠️ Failed cloud getOrderById: $e');
-      debugPrint('Stack: $stack');
+    debugPrint('[RESUME_ORDER] getOrderById: $orderId (platform: ${kIsWeb ? "web" : "device"}, onlineOnly: $onlineOnly)');
+    
+    if (kIsWeb || onlineOnly) {
+      // Web or forced online: Try cloud first
+      try {
+        final cloud = await _cloudRepo.getOrderById(orderId);
+        if (cloud != null) {
+          debugPrint('[RESUME_ORDER] ✅ Found in cloud');
+          return cloud;
+        }
+      } catch (e, stack) {
+        debugPrint('[RESUME_ORDER] ⚠️ Failed cloud getOrderById: $e');
+        debugPrint('Stack: $stack');
+        if (onlineOnly) {
+          return null;
+        }
+      }
+
       if (onlineOnly) {
         return null;
       }
-    }
 
-    if (onlineOnly) {
-      return null;
+      // Fallback to local
+      debugPrint('[RESUME_ORDER] Falling back to local');
+      return _offlineRepo.getOrderById(orderId);
+    } else {
+      // Device: LOCAL-FIRST (prefer local pending orders)
+      debugPrint('[RESUME_ORDER] Device: Checking local first');
+      final local = await _offlineRepo.getOrderById(orderId);
+      if (local != null) {
+        debugPrint('[RESUME_ORDER] ✅ Found locally');
+        return local;
+      }
+      
+      // If not found locally, try cloud as fallback
+      debugPrint('[RESUME_ORDER] Not found locally, checking cloud');
+      try {
+        final cloud = await _cloudRepo.getOrderById(orderId);
+        if (cloud != null) {
+          debugPrint('[RESUME_ORDER] ✅ Found in cloud');
+        }
+        return cloud;
+      } catch (e, stack) {
+        debugPrint('[RESUME_ORDER] ⚠️ Failed cloud getOrderById: $e');
+        debugPrint('Stack: $stack');
+        return null;
+      }
     }
-
-    return _offlineRepo.getOrderById(orderId);
   }
 
   Future<EposOrder?> findOpenOrderByTable(String tableId, {bool onlineOnly = false}) async {
@@ -350,24 +436,89 @@ class OrderRepositoryHybrid {
   }
 
   Future<List<EposOrderItem>> getOrderItems(String orderId, {bool onlineOnly = false}) async {
-    try {
-      final cloud = await _cloudRepo.getOrderItems(orderId);
-      if (cloud.isNotEmpty) return cloud;
-    } catch (e, stack) {
-      debugPrint('⚠️ Failed cloud getOrderItems: $e');
-      debugPrint('Stack: $stack');
+    debugPrint('[RESUME_ORDER] getOrderItems: $orderId (platform: ${kIsWeb ? "web" : "device"}, onlineOnly: $onlineOnly)');
+    
+    if (kIsWeb || onlineOnly) {
+      // Web or forced online: Try cloud first
+      try {
+        final cloud = await _cloudRepo.getOrderItems(orderId);
+        if (cloud.isNotEmpty) {
+          debugPrint('[RESUME_ORDER] ✅ Found ${cloud.length} items in cloud');
+          return cloud;
+        }
+      } catch (e, stack) {
+        debugPrint('[RESUME_ORDER] ⚠️ Failed cloud getOrderItems: $e');
+        debugPrint('Stack: $stack');
+        if (onlineOnly) {
+          return [];
+        }
+      }
+
       if (onlineOnly) {
         return [];
       }
-    }
 
-    if (onlineOnly) {
+      // Fallback to local
+      debugPrint('[RESUME_ORDER] Falling back to local items');
+      return _offlineRepo.getOrderItems(orderId);
+    } else {
+      // Device: LOCAL-FIRST with cloud reconciliation
+      // CROSS-TILL SUPPORT: Check both local and cloud, merge if cloud has newer data
+      debugPrint('[RESUME_ORDER] Device: Checking local items first');
+      final local = await _offlineRepo.getOrderItems(orderId);
+      debugPrint('[RESUME_ORDER] Local items count: ${local.length}');
+      
+      // If online, also check cloud for newer items (cross-till edits)
+      if (_connectionService.isOnline) {
+        try {
+          final cloud = await _cloudRepo.getOrderItems(orderId);
+          debugPrint('[RESUME_ORDER] Cloud items count: ${cloud.length}');
+          
+          // If cloud has more items or different count, prefer cloud (cross-till edit detected)
+          if (cloud.length != local.length) {
+            debugPrint('[RESUME_ORDER] ⚠️ Item count mismatch detected (local: ${local.length}, cloud: ${cloud.length})');
+            
+            if (cloud.length > local.length) {
+              debugPrint('[RESUME_ORDER] ✅ Cloud has newer items (cross-till edit), using cloud version');
+              debugPrint('[RESUME_ORDER]    This order was likely edited on another till');
+              return cloud;
+            } else {
+              debugPrint('[RESUME_ORDER] ⚠️ Local has more items than cloud - using local (may have pending sync)');
+              return local;
+            }
+          }
+          
+          // Same count - prefer local for offline-first consistency
+          if (local.isNotEmpty) {
+            debugPrint('[RESUME_ORDER] ✅ Using ${local.length} local items (same count as cloud)');
+            return local;
+          }
+          
+          // Local empty but cloud has items - use cloud
+          if (cloud.isNotEmpty) {
+            debugPrint('[RESUME_ORDER] ✅ Local empty, using ${cloud.length} cloud items');
+            return cloud;
+          }
+        } catch (e, stack) {
+          debugPrint('[RESUME_ORDER] ⚠️ Failed cloud getOrderItems: $e');
+          debugPrint('Stack: $stack');
+          // Continue with local items
+        }
+      }
+      
+      // Offline or cloud check failed - use local items
+      if (local.isNotEmpty) {
+        debugPrint('[RESUME_ORDER] ✅ Using ${local.length} local items (offline or cloud unavailable)');
+        return local;
+      }
+      
+      debugPrint('[RESUME_ORDER] ⚠️ No items found locally or in cloud');
       return [];
     }
-
-    return _offlineRepo.getOrderItems(orderId);
   }
 
+  /// Create table order header
+  /// Platform-aware: Device builds use offline-first, web uses online-only
   Future<EposOrder?> createOrderHeaderForTable({
     required String outletId,
     required String tableId,
@@ -375,14 +526,78 @@ class OrderRepositoryHybrid {
     String? staffId,
     int? covers,
   }) async {
-    return createOrderHeader(
+    debugPrint('[TABLE_FLOW] Creating table order header (platform: ${kIsWeb ? "web" : "device"})');
+    
+    if (kIsWeb) {
+      // Web: online-only (direct Supabase, no offline queue)
+      debugPrint('[TABLE_FLOW] Using CLOUD path (web)');
+      return createOrderHeader(
+        outletId: outletId,
+        staffId: staffId,
+        orderType: 'table',
+        tableId: tableId,
+        tableNumber: tableNumber,
+        covers: covers,
+        onlineOnly: true,
+      );
+    } else {
+      // Device: LOCAL-ONLY (no Supabase insert, only local save + queue)
+      debugPrint('[TABLE_FLOW] Using LOCAL-ONLY path (device)');
+      return _createTableOrderLocalOnly(
+        outletId: outletId,
+        tableId: tableId,
+        tableNumber: tableNumber,
+        staffId: staffId,
+        covers: covers,
+      );
+    }
+  }
+  
+  /// Device-only: Create table order locally without touching Supabase
+  Future<EposOrder?> _createTableOrderLocalOnly({
+    required String outletId,
+    required String tableId,
+    required String tableNumber,
+    String? staffId,
+    int? covers,
+  }) async {
+    debugPrint('[ORDER_REPO] Creating table order LOCAL-ONLY (no Supabase insert)');
+    debugPrint('[ORDER_REPO]    Table ID: $tableId');
+    debugPrint('[ORDER_REPO]    Table Number: $tableNumber');
+    
+    // Create order header locally
+    final localOrder = await _offlineRepo.createOrderHeader(
       outletId: outletId,
       staffId: staffId,
       orderType: 'table',
       tableId: tableId,
       tableNumber: tableNumber,
       covers: covers,
-      onlineOnly: true,
     );
+    
+    if (localOrder == null) {
+      debugPrint('[ORDER_REPO] ❌ Failed to create local table order');
+      return null;
+    }
+    
+    debugPrint('[ORDER_REPO]    Created order ID: ${localOrder.id}');
+    debugPrint('[ORDER_REPO]    Stored table_id: ${localOrder.tableId}');
+    debugPrint('[ORDER_REPO]    Stored table_number: ${localOrder.tableNumber}');
+    
+    // Save locally with sync_status='pending' and queue for sync
+    final saved = await _offlineRepo.upsertOrderWithItems(
+      localOrder, 
+      const [], 
+      queueForSync: true,  // Queue immediately for sync
+    );
+    
+    if (!saved) {
+      debugPrint('[ORDER_REPO] ❌ Failed to save local table order');
+      return null;
+    }
+    
+    debugPrint('[ORDER_REPO] ✅ Table order created locally: ${localOrder.id}');
+    debugPrint('[ORDER_REPO]    sync_status=pending, queued for upload');
+    return localOrder;
   }
 }
